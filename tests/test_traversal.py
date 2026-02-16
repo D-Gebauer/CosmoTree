@@ -48,10 +48,8 @@ def test_traverse_two_clusters():
     assert len(leaves) == 4 # 2x2 pairs
     
     # Check leaf pairs
-    # Indices in leaves refer to idx_array indices? No, original indices?
-    # In build_tree, idx_array maps tree_order -> original_index.
-    # In traversal, we output aidx[k] which is original index.
-    # So leaves contains pairs of original indices.
+    # In traversal, leaves contains tree-order indices.
+    # Map them back to original indices using idx_array.
     
     # Cluster A indices: 0, 1. Cluster B indices: 0, 1 (in their respective arrays).
     # Since we passed separate arrays, indices are 0-based for each tree.
@@ -59,7 +57,9 @@ def test_traverse_two_clusters():
     expected = {(0,0), (0,1), (1,0), (1,1)}
     found = set()
     for i in range(len(leaves)):
-        found.add((leaves[i, 0], leaves[i, 1]))
+        idx_a = tree_a['idx_array'][leaves[i, 0]]
+        idx_b = tree_b['idx_array'][leaves[i, 1]]
+        found.add((idx_a, idx_b))
     assert found == expected
 
 def test_interaction_list_format():
@@ -109,10 +109,12 @@ def test_auto_correlation_symmetry():
     
     assert len(leaves) == 6
     
-    # Check indices
+    # Check indices (map tree-order back to original indices)
     found = set()
     for i in range(len(leaves)):
-        pair = tuple(sorted((leaves[i, 0], leaves[i, 1])))
+        idx_a = tree['idx_array'][leaves[i, 0]]
+        idx_b = tree['idx_array'][leaves[i, 1]]
+        pair = tuple(sorted((idx_a, idx_b)))
         found.add(pair)
         
     expected = {(0,1), (0,2), (0,3), (1,2), (1,3), (2,3)}

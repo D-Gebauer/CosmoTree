@@ -124,7 +124,7 @@ def _traverse_numba(
             end_b = bend[j]
             
             for ka in range(start_a, end_a):
-                idx_a = aidx[ka]
+                idx_a = ka
                 
                 start_kb = start_b
                 # If same leaf in auto-corr, avoid self-pairs and double counting
@@ -132,7 +132,7 @@ def _traverse_numba(
                     start_kb = ka + 1
                 
                 for kb in range(start_kb, end_b):
-                    idx_b = bidx[kb]
+                    idx_b = kb
                     
                     if leaf_ptr < max_leaf:
                         leaf_pairs[leaf_ptr, 0] = idx_a
@@ -263,6 +263,9 @@ def traverse(
         )
 
         if status == 0:
+            if inter.shape[0] > 0:
+                order = np.lexsort((inter[:, 1], inter[:, 0]))
+                inter = inter[order]
             return inter, leaves
 
         if status == -1:

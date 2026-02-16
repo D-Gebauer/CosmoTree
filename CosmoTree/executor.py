@@ -331,8 +331,11 @@ def execute_tree_correlation(
             )
         
     if d_leaves.shape[0] > 0:
-        d_shear = cp.asarray(shear_map)
-        d_w = cp.asarray(w_map)
+        order = tree['idx_array']
+        ordered_shear = shear_map[order]
+        ordered_w = w_map[order]
+        d_shear = cp.asarray(ordered_shear)
+        d_w = cp.asarray(ordered_w)
         g_pix = d_shear[:, 0] + 1j * d_shear[:, 1]
 
         px, py, pz = None, None, None
@@ -344,17 +347,19 @@ def execute_tree_correlation(
                 raise ValueError("particle_coords arrays must have matching lengths")
             if n_coords != n_pix:
                 raise ValueError("particle_coords length must match shear_map length")
-            px = cp.asarray(particle_coords[0])
-            py = cp.asarray(particle_coords[1])
-            pz = cp.asarray(particle_coords[2])
+            px = cp.asarray(particle_coords[0][order])
+            py = cp.asarray(particle_coords[1][order])
+            pz = cp.asarray(particle_coords[2][order])
         elif ra is not None and dec is not None:
             if len(ra) != len(dec):
                 raise ValueError("ra and dec must have matching lengths")
             if len(ra) != n_pix:
                 raise ValueError("ra/dec length must match shear_map length")
-            x = np.cos(dec) * np.cos(ra)
-            y = np.cos(dec) * np.sin(ra)
-            z = np.sin(dec)
+            ra_ord = ra[order]
+            dec_ord = dec[order]
+            x = np.cos(dec_ord) * np.cos(ra_ord)
+            y = np.cos(dec_ord) * np.sin(ra_ord)
+            z = np.sin(dec_ord)
             px = cp.asarray(x)
             py = cp.asarray(y)
             pz = cp.asarray(z)
