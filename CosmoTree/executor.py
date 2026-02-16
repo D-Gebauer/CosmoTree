@@ -1,6 +1,7 @@
 import numpy as np
 import warnings
 from functools import lru_cache
+from numba import njit, prange
 
 try:
     import cupy as cp
@@ -451,6 +452,245 @@ def _prepare_particle_coords(particle_coords, ra, dec, n_pix, order, real_dtype)
     )
 
 
+_CPU_BATCH_SIZE = 4096
+
+
+def _resolve_device(device):
+    if device is None:
+        return "auto"
+    d = str(device).strip().lower()
+    if d not in ("auto", "cpu", "gpu"):
+        raise ValueError("device must be one of: 'auto', 'cpu', 'gpu'")
+    return d
+
+
+@njit(parallel=True, fastmath=True)
+def _build_node_shear_cpu(maps_np, weights_np, child_left, child_right, node_start, node_end, idx_array):
+    n_tomo = maps_np.shape[0]
+    n_nodes = child_left.shape[0]
+    node_shear = np.zeros((n_tomo, n_nodes), dtype=np.complex128)
+
+    for t in prange(n_tomo):
+        for node in range(n_nodes - 1, -1, -1):
+            left = child_left[node]
+            if left == -1:
+                start = node_start[node]
+                end = node_end[node]
+                sum_re = 0.0
+                sum_im = 0.0
+                for pos in range(start, end):
+                    idx = idx_array[pos]
+                    w = weights_np[t, idx]
+                    sum_re += maps_np[t, 0, idx] * w
+                    sum_im += maps_np[t, 1, idx] * w
+                node_shear[t, node] = sum_re + 1j * sum_im
+            else:
+                right = child_right[node]
+                node_shear[t, node] = node_shear[t, left] + node_shear[t, right]
+
+    return node_shear
+
+
+@njit(parallel=True, fastmath=True)
+def _execute_cpu_kernel(shear_maps, interaction_list, bin_indices, n_sims, n_bins):
+    n_pairs = interaction_list.shape[0]
+    out = np.zeros((n_sims, n_sims, n_bins), dtype=np.float64)
+    if n_pairs == 0:
+        return out
+
+    for batch_start in range(0, n_pairs, _CPU_BATCH_SIZE):
+        batch_end = min(batch_start + _CPU_BATCH_SIZE, n_pairs)
+        batch_len = batch_end - batch_start
+        batch_vals = np.zeros((batch_len, n_sims, n_sims), dtype=np.float64)
+        batch_bins = np.full(batch_len, -1, dtype=np.int32)
+
+        for local_k in prange(batch_len):
+            k = batch_start + local_k
+            i = int(interaction_list[k, 0])
+            j = int(interaction_list[k, 1])
+            rr = interaction_list[k, 2]
+            ri = interaction_list[k, 3]
+            b = bin_indices[k]
+
+            if i < 0 or j < 0 or b < 0 or b >= n_bins:
+                continue
+
+            batch_bins[local_k] = b
+            for s1 in range(n_sims):
+                gi = shear_maps[s1, i]
+                for s2 in range(s1, n_sims):
+                    gj = shear_maps[s2, j]
+                    prod_re = gi.real * gj.real + gi.imag * gj.imag
+                    prod_im = gi.imag * gj.real - gi.real * gj.imag
+                    batch_vals[local_k, s1, s2] = prod_re * rr - prod_im * ri
+
+        for local_k in range(batch_len):
+            b = batch_bins[local_k]
+            if b < 0:
+                continue
+            for s1 in range(n_sims):
+                for s2 in range(s1, n_sims):
+                    out[s1, s2, b] += batch_vals[local_k, s1, s2]
+
+    return out
+
+
+@njit(parallel=True, fastmath=True)
+def _execute_cpu_leaf_kernel(ordered_maps, ordered_weights, leaf_pairs, leaf_bins, px, py, pz, n_sims, n_bins):
+    n_pairs = leaf_pairs.shape[0]
+    out = np.zeros((n_sims, n_sims, n_bins), dtype=np.float64)
+    if n_pairs == 0:
+        return out
+
+    n_pix = ordered_maps.shape[2]
+    for batch_start in range(0, n_pairs, _CPU_BATCH_SIZE):
+        batch_end = min(batch_start + _CPU_BATCH_SIZE, n_pairs)
+        batch_len = batch_end - batch_start
+        batch_vals = np.zeros((batch_len, n_sims, n_sims), dtype=np.float64)
+        batch_bins = np.full(batch_len, -1, dtype=np.int32)
+
+        for local_k in prange(batch_len):
+            k = batch_start + local_k
+            ia = leaf_pairs[k, 0]
+            ib = leaf_pairs[k, 1]
+            b = leaf_bins[k]
+            if ia < 0 or ib < 0 or ia >= n_pix or ib >= n_pix or b < 0 or b >= n_bins:
+                continue
+
+            ax = px[ia]
+            ay = py[ia]
+            az = pz[ia]
+            bx = px[ib]
+            by = py[ib]
+            bz = pz[ib]
+
+            r2 = ax * ax + ay * ay
+            r = np.sqrt(r2)
+            if r > 1e-9:
+                cos_ra = ax / r
+                sin_ra = ay / r
+                cos_dec = r
+                sin_dec = az
+                ux = -sin_ra
+                uy = cos_ra
+                uz = 0.0
+                vx = -sin_dec * cos_ra
+                vy = -sin_dec * sin_ra
+                vz = cos_dec
+            else:
+                ux = 1.0
+                uy = 0.0
+                uz = 0.0
+                vx = 0.0
+                vy = 1.0
+                vz = 0.0
+
+            dx = bx - ax
+            dy = by - ay
+            dz = bz - az
+            xp = dx * ux + dy * uy + dz * uz
+            yp = dx * vx + dy * vy + dz * vz
+            angle = -2.0 * np.arctan2(yp, xp)
+            rr = np.cos(angle)
+            ri = np.sin(angle)
+
+            batch_bins[local_k] = b
+            for s1 in range(n_sims):
+                wa = ordered_weights[s1, ia]
+                ga_re = ordered_maps[s1, 0, ia] * wa
+                ga_im = ordered_maps[s1, 1, ia] * wa
+                for s2 in range(s1, n_sims):
+                    wb = ordered_weights[s2, ib]
+                    gb_re = ordered_maps[s2, 0, ib] * wb
+                    gb_im = ordered_maps[s2, 1, ib] * wb
+                    prod_re = ga_re * gb_re + ga_im * gb_im
+                    prod_im = ga_im * gb_re - ga_re * gb_im
+                    batch_vals[local_k, s1, s2] = prod_re * rr - prod_im * ri
+
+        for local_k in range(batch_len):
+            b = batch_bins[local_k]
+            if b < 0:
+                continue
+            for s1 in range(n_sims):
+                for s2 in range(s1, n_sims):
+                    out[s1, s2, b] += batch_vals[local_k, s1, s2]
+
+    return out
+
+
+def _execute_tree_correlation_cpu(
+    maps_np,
+    weights_np,
+    tree,
+    inter_i,
+    inter_j,
+    inter_rot_re,
+    inter_rot_im,
+    inter_bins,
+    leaf_pairs_np,
+    leaf_bins_np,
+    order,
+    ordered_coords,
+    n_bins,
+    np_real_dtype,
+):
+    n_tomo = maps_np.shape[0]
+    n_nodes = len(tree["x"])
+    out = np.zeros((n_tomo, n_tomo, n_bins), dtype=np.float64)
+
+    child_left = np.asarray(tree["child_left"], dtype=np.int32)
+    child_right = np.asarray(tree["child_right"], dtype=np.int32)
+    node_start = np.asarray(tree["node_start"], dtype=np.int64)
+    node_end = np.asarray(tree["node_end"], dtype=np.int64)
+    idx_array = np.asarray(tree["idx_array"], dtype=np.int64)
+
+    node_shear_all = _build_node_shear_cpu(
+        np.asarray(maps_np, dtype=np.float64),
+        np.asarray(weights_np, dtype=np.float64),
+        child_left,
+        child_right,
+        node_start,
+        node_end,
+        idx_array,
+    )
+    if node_shear_all.shape != (n_tomo, n_nodes):
+        raise RuntimeError("Internal error while building CPU node shear map")
+
+    if inter_i.size > 0:
+        inter_values = np.empty((inter_i.size, 4), dtype=np.float64)
+        inter_values[:, 0] = inter_i.astype(np.float64)
+        inter_values[:, 1] = inter_j.astype(np.float64)
+        inter_values[:, 2] = inter_rot_re.astype(np.float64)
+        inter_values[:, 3] = inter_rot_im.astype(np.float64)
+        out += _execute_cpu_kernel(
+            node_shear_all,
+            inter_values,
+            np.ascontiguousarray(inter_bins.astype(np.int32)),
+            n_tomo,
+            n_bins,
+        )
+
+    if leaf_pairs_np.shape[0] > 0:
+        if ordered_coords is None:
+            raise RuntimeError("ordered_coords must be provided when leaf_pairs are non-empty")
+        ordered_maps = np.ascontiguousarray(maps_np[:, :, order], dtype=np.float64)
+        ordered_weights = np.ascontiguousarray(weights_np[:, order], dtype=np.float64)
+        px, py, pz = ordered_coords
+        out += _execute_cpu_leaf_kernel(
+            ordered_maps,
+            ordered_weights,
+            np.ascontiguousarray(leaf_pairs_np, dtype=np.int64),
+            np.ascontiguousarray(leaf_bins_np, dtype=np.int32),
+            np.ascontiguousarray(px, dtype=np.float64),
+            np.ascontiguousarray(py, dtype=np.float64),
+            np.ascontiguousarray(pz, dtype=np.float64),
+            n_tomo,
+            n_bins,
+        )
+
+    return np.ascontiguousarray(out.astype(np_real_dtype, copy=False))
+
+
 def _fill_tree_gpu(shear_map, w_map, tree, levels, kernels, cp_real_dtype, cp_complex_dtype):
     if cp is None:
         raise RuntimeError("CuPy not installed.")
@@ -502,48 +742,28 @@ def _fill_tree_gpu(shear_map, w_map, tree, levels, kernels, cp_real_dtype, cp_co
     return node_shear, node_weight
 
 
-def execute_tree_correlation(
-    maps,
-    w_map,
+def _execute_tree_correlation_gpu(
+    maps_np,
+    weights_np,
     tree,
-    interaction_list,
-    leaf_pairs,
+    inter_i,
+    inter_j,
+    inter_rot_re,
+    inter_rot_im,
+    inter_bins,
+    leaf_pairs_np,
+    leaf_bins_np,
+    order,
+    ordered_coords,
     n_bins,
-    leaf_bins=None,
-    particle_coords=None,
-    ra=None,
-    dec=None,
-    dtype=np.float32,
+    precision,
 ):
-    precision = _resolve_precision(dtype)
     np_real_dtype = precision["np_real"]
-
-    maps_np = _normalize_maps(maps, np_real_dtype)
-    n_tomo, _, n_pix = maps_np.shape
-    weights_np = _normalize_weights(w_map, n_tomo, n_pix, np_real_dtype)
-    n_bins = _validate_n_bins(n_bins)
-
-    inter_i, inter_j, inter_rot_re, inter_rot_im, inter_bins = _normalize_interactions(
-        interaction_list, tree, n_bins, np_real_dtype
-    )
-    leaf_pairs_np, leaf_bins_np = _normalize_leaf_inputs(leaf_pairs, leaf_bins, n_bins, n_pix)
-
-    order = np.asarray(tree["idx_array"], dtype=np.int64)
-    if order.shape[0] != n_pix:
-        raise ValueError("tree['idx_array'] length must match n_pixels")
-
-    ordered_coords = None
-    if leaf_pairs_np.shape[0] > 0:
-        ordered_coords = _prepare_particle_coords(particle_coords, ra, dec, n_pix, order, np_real_dtype)
-
-    if cp is None:
-        warnings.warn("CuPy not found. Returning zeros.", stacklevel=2)
-        return np.zeros((n_tomo, n_tomo, n_bins), dtype=np_real_dtype)
-
-    kernels = _get_precision_kernels(precision["np_real_name"])
     cp_real_dtype = precision["cp_real"]
     cp_complex_dtype = precision["cp_complex"]
+    kernels = _get_precision_kernels(precision["np_real_name"])
 
+    n_tomo, _, n_pix = maps_np.shape
     parents = tree["parents"]
     levels = _get_levels(parents)
     n_nodes = len(tree["x"])
@@ -595,7 +815,10 @@ def execute_tree_correlation(
 
         d_ordered_maps = cp.asarray(ordered_maps, dtype=cp_real_dtype)
         imag_unit = cp.asarray(1j, dtype=cp_complex_dtype)
-        d_g_pix = d_ordered_maps[:, 0, :].astype(cp_complex_dtype) + d_ordered_maps[:, 1, :].astype(cp_complex_dtype) * imag_unit
+        d_g_pix = (
+            d_ordered_maps[:, 0, :].astype(cp_complex_dtype)
+            + d_ordered_maps[:, 1, :].astype(cp_complex_dtype) * imag_unit
+        )
         d_w_pix = cp.asarray(ordered_weights, dtype=cp_real_dtype)
 
         leaf_i = np.ascontiguousarray(leaf_pairs_np[:, 0], dtype=np.int64)
@@ -632,3 +855,79 @@ def execute_tree_correlation(
         )
 
     return out.get()
+
+
+def execute_tree_correlation(
+    maps,
+    w_map,
+    tree,
+    interaction_list,
+    leaf_pairs,
+    n_bins,
+    leaf_bins=None,
+    particle_coords=None,
+    ra=None,
+    dec=None,
+    dtype=np.float32,
+    device="auto",
+):
+    precision = _resolve_precision(dtype)
+    np_real_dtype = precision["np_real"]
+    run_device = _resolve_device(device)
+
+    maps_np = _normalize_maps(maps, np_real_dtype)
+    n_tomo, _, n_pix = maps_np.shape
+    weights_np = _normalize_weights(w_map, n_tomo, n_pix, np_real_dtype)
+    n_bins = _validate_n_bins(n_bins)
+
+    inter_i, inter_j, inter_rot_re, inter_rot_im, inter_bins = _normalize_interactions(
+        interaction_list, tree, n_bins, np_real_dtype
+    )
+    leaf_pairs_np, leaf_bins_np = _normalize_leaf_inputs(leaf_pairs, leaf_bins, n_bins, n_pix)
+
+    order = np.asarray(tree["idx_array"], dtype=np.int64)
+    if order.shape[0] != n_pix:
+        raise ValueError("tree['idx_array'] length must match n_pixels")
+
+    ordered_coords = None
+    if leaf_pairs_np.shape[0] > 0:
+        ordered_coords = _prepare_particle_coords(particle_coords, ra, dec, n_pix, order, np_real_dtype)
+
+    use_gpu = run_device in ("auto", "gpu") and cp is not None
+    if run_device == "gpu" and cp is None:
+        warnings.warn("CuPy not found. Falling back to CPU execution.", stacklevel=2)
+
+    if use_gpu:
+        return _execute_tree_correlation_gpu(
+            maps_np,
+            weights_np,
+            tree,
+            inter_i,
+            inter_j,
+            inter_rot_re,
+            inter_rot_im,
+            inter_bins,
+            leaf_pairs_np,
+            leaf_bins_np,
+            order,
+            ordered_coords,
+            n_bins,
+            precision,
+        )
+
+    return _execute_tree_correlation_cpu(
+        maps_np,
+        weights_np,
+        tree,
+        inter_i,
+        inter_j,
+        inter_rot_re,
+        inter_rot_im,
+        inter_bins,
+        leaf_pairs_np,
+        leaf_bins_np,
+        order,
+        ordered_coords,
+        n_bins,
+        np_real_dtype,
+    )

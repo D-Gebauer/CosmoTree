@@ -40,38 +40,20 @@ def test_executor_tomographic_output_shape():
     maps_tomo = np.stack([maps_legacy.T, (0.5 * maps_legacy).T], axis=0)
     w_tomo = np.stack([w, 0.5 * w], axis=0)
 
-    if not cupy_available:
-        with warnings.catch_warnings(record=True) as w_log:
-            warnings.simplefilter("always")
-            corr = execute_tree_correlation(
-                maps_tomo,
-                w_tomo,
-                tree,
-                inter,
-                leaves,
-                n_bins=n_bins,
-                leaf_bins=leaf_bins,
-                particle_coords=coords,
-            )
-            assert corr.shape == (2, 2, n_bins)
-            assert np.all(corr == 0.0)
-            assert corr.dtype == np.float32
-            assert len(w_log) >= 1
-            assert "CuPy not found" in str(w_log[0].message)
-    else:
-        corr = execute_tree_correlation(
-            maps_tomo,
-            w_tomo,
-            tree,
-            inter,
-            leaves,
-            n_bins=n_bins,
-            leaf_bins=leaf_bins,
-            particle_coords=coords,
-        )
-        assert corr.shape == (2, 2, n_bins)
-        assert np.issubdtype(corr.dtype, np.floating)
-        assert np.all(corr[np.tril_indices(2, -1)] == 0.0)
+    corr = execute_tree_correlation(
+        maps_tomo,
+        w_tomo,
+        tree,
+        inter,
+        leaves,
+        n_bins=n_bins,
+        leaf_bins=leaf_bins,
+        particle_coords=coords,
+    )
+    assert corr.shape == (2, 2, n_bins)
+    assert np.issubdtype(corr.dtype, np.floating)
+    assert np.all(np.isfinite(corr))
+    assert np.all(corr[np.tril_indices(2, -1)] == 0.0)
 
 
 def test_executor_single_bin_shorthand_shape():
@@ -107,6 +89,59 @@ def test_executor_legacy_n_by_2_shape():
         particle_coords=coords,
     )
     assert corr.shape == (1, 1, n_bins)
+
+
+def test_executor_device_dispatch():
+    tree, maps_legacy, w, inter, leaves, leaf_bins, coords = _build_inputs()
+    n_bins = 8
+    maps_tomo = np.stack([maps_legacy.T, (0.5 * maps_legacy).T], axis=0)
+    w_tomo = np.stack([w, 0.5 * w], axis=0)
+
+    corr_cpu = execute_tree_correlation(
+        maps_tomo,
+        w_tomo,
+        tree,
+        inter,
+        leaves,
+        n_bins=n_bins,
+        leaf_bins=leaf_bins,
+        particle_coords=coords,
+        device="cpu",
+    )
+    assert corr_cpu.shape == (2, 2, n_bins)
+    assert np.all(corr_cpu[np.tril_indices(2, -1)] == 0.0)
+
+    if cupy_available:
+        corr_gpu = execute_tree_correlation(
+            maps_tomo,
+            w_tomo,
+            tree,
+            inter,
+            leaves,
+            n_bins=n_bins,
+            leaf_bins=leaf_bins,
+            particle_coords=coords,
+            device="gpu",
+        )
+        assert corr_gpu.shape == corr_cpu.shape
+        assert np.all(corr_gpu[np.tril_indices(2, -1)] == 0.0)
+        np.testing.assert_allclose(corr_cpu, corr_gpu, rtol=2e-5, atol=2e-7)
+    else:
+        with warnings.catch_warnings(record=True) as w_log:
+            warnings.simplefilter("always")
+            corr_gpu_req = execute_tree_correlation(
+                maps_tomo,
+                w_tomo,
+                tree,
+                inter,
+                leaves,
+                n_bins=n_bins,
+                leaf_bins=leaf_bins,
+                particle_coords=coords,
+                device="gpu",
+            )
+        assert np.allclose(corr_gpu_req, corr_cpu)
+        assert any("falling back to cpu" in str(w.message).lower() for w in w_log)
 
 
 def test_executor_validation_errors():
@@ -174,6 +209,18 @@ def test_executor_validation_errors():
             dtype=np.float16,
         )
 
+    with pytest.raises(ValueError, match="device must be one of"):
+        execute_tree_correlation(
+            maps_legacy,
+            w,
+            tree,
+            inter,
+            np.empty((0, 2), dtype=np.int64),
+            n_bins=8,
+            leaf_bins=np.empty(0, dtype=np.int32),
+            device="tpu",
+        )
+
 
 def test_executor_dtype_override():
     tree, maps_legacy, w, inter, leaves, leaf_bins, coords = _build_inputs()
@@ -194,6 +241,7 @@ if __name__ == "__main__":
     test_executor_tomographic_output_shape()
     test_executor_single_bin_shorthand_shape()
     test_executor_legacy_n_by_2_shape()
+    test_executor_device_dispatch()
     test_executor_validation_errors()
     test_executor_dtype_override()
     print("Test passed")

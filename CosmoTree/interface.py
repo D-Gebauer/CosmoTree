@@ -185,6 +185,7 @@ class CosmoTree:
         ra=None,
         dec=None,
         dtype=None,
+        device="auto",
     ):
         if self._geometry is None:
             raise RuntimeError("preprocess must be run before process")
@@ -211,6 +212,7 @@ class CosmoTree:
             ra=ra_arg,
             dec=dec_arg,
             dtype=run_dtype,
+            device=device,
         )
 
     def save(self, filename):
