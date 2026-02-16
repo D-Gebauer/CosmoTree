@@ -19,7 +19,7 @@ def _traverse_numba(
     stack = np.empty((max_stack, 2), dtype=np.int32)
     stack_ptr = 0
     
-    interaction_list = np.empty((max_inter, 2), dtype=np.int32)
+    interaction_list = np.empty((max_inter, 4), dtype=np.float64)
     inter_ptr = 0
     
     leaf_pairs = np.empty((max_leaf, 2), dtype=np.int64)
@@ -60,8 +60,53 @@ def _traverse_numba(
                 
         if can_approximate:
             if inter_ptr < max_inter:
-                interaction_list[inter_ptr, 0] = i
-                interaction_list[inter_ptr, 1] = j
+                ax_i = ax[i]
+                ay_i = ay[i]
+                az_i = az[i]
+
+                bx_j = bx[j]
+                by_j = by[j]
+                bz_j = bz[j]
+
+                r2 = ax_i * ax_i + ay_i * ay_i
+                r = np.sqrt(r2)
+                if r > 1e-9:
+                    cos_ra = ax_i / r
+                    sin_ra = ay_i / r
+                    cos_dec = r
+                    sin_dec = az_i
+
+                    ux = -sin_ra
+                    uy = cos_ra
+                    uz = 0.0
+
+                    vx = -sin_dec * cos_ra
+                    vy = -sin_dec * sin_ra
+                    vz = cos_dec
+                else:
+                    ux = 1.0
+                    uy = 0.0
+                    uz = 0.0
+                    vx = 0.0
+                    vy = 1.0
+                    vz = 0.0
+
+                dxp = bx_j - ax_i
+                dyp = by_j - ay_i
+                dzp = bz_j - az_i
+
+                xp = dxp * ux + dyp * uy + dzp * uz
+                yp = dxp * vx + dyp * vy + dzp * vz
+
+                phi = np.arctan2(yp, xp)
+                angle = -2.0 * phi
+                rot_re = np.cos(angle)
+                rot_im = np.sin(angle)
+
+                interaction_list[inter_ptr, 0] = float(i)
+                interaction_list[inter_ptr, 1] = float(j)
+                interaction_list[inter_ptr, 2] = rot_re
+                interaction_list[inter_ptr, 3] = rot_im
                 inter_ptr += 1
             else:
                 return interaction_list, leaf_pairs, -1

@@ -34,6 +34,9 @@ def test_traverse_two_clusters():
     # Roots are index 0.
     assert inter[0, 0] == 0
     assert inter[0, 1] == 0
+    assert inter.shape[1] == 4
+    assert np.isfinite(inter[0, 2])
+    assert np.isfinite(inter[0, 3])
     
     # 2. Approximation disallowed (large slop or small theta implied)
     # Force descent by setting slop large, e.g., 1.0.
@@ -58,6 +61,24 @@ def test_traverse_two_clusters():
     for i in range(len(leaves)):
         found.add((leaves[i, 0], leaves[i, 1]))
     assert found == expected
+
+def test_interaction_list_format():
+    ra_a = np.array([0.0, 0.01])
+    dec_a = np.array([0.0, 0.01])
+    w_a = np.ones(2)
+
+    ra_b = np.array([0.5, 0.51])
+    dec_b = np.array([0.0, 0.01])
+    w_b = np.ones(2)
+
+    tree_a = build_tree(ra_a, dec_a, w_a, min_size=0.0)
+    tree_b = build_tree(ra_b, dec_b, w_b, min_size=0.0)
+
+    inter, leaves = traverse(tree_a, tree_b, min_sep=0.1, max_sep=1.0, slop=0.0)
+
+    assert inter.ndim == 2
+    assert inter.shape[1] == 4
+    assert len(leaves) == 0
 
 def test_auto_correlation_symmetry():
     # 4 points close to each other

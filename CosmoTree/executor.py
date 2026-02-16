@@ -112,6 +112,20 @@ try:
         preamble='#include <thrust/complex.h>'
     )
 
+    _tree_corr_precomputed_kernel = cp.ElementwiseKernel(
+        'int32 i, int32 j, raw complex128 node_shear, raw float64 node_weight, raw float64 rot_re, raw float64 rot_im',
+        'complex128 corr, float64 w_prod',
+        '''
+        thrust::complex<double> gi = node_shear[i];
+        thrust::complex<double> gj = node_shear[j];
+        thrust::complex<double> rot = thrust::complex<double>(rot_re, rot_im);
+        corr = gi * thrust::conj(gj) * rot;
+        w_prod = node_weight[i] * node_weight[j];
+        ''',
+        'tree_corr_precomputed_kernel',
+        preamble='#include <thrust/complex.h>'
+    )
+
     _leaf_pair_kernel = cp.ElementwiseKernel(
         'int64 idx_a, int64 idx_b, raw complex128 g_pix, raw float64 w_pix, raw float64 px, raw float64 py, raw float64 pz',
         'complex128 corr, float64 w_prod',
@@ -174,6 +188,7 @@ except ImportError:
     _leaf_sum_kernel = None
     _node_agg_kernel = None
     _tree_corr_kernel = None
+    _tree_corr_precomputed_kernel = None
     _leaf_pair_kernel = None
 
 def _get_levels(parents):
@@ -259,6 +274,11 @@ def execute_tree_correlation(
     if w_map.shape[0] != n_pix:
         raise ValueError("w_map length must match shear_map length")
 
+    if interaction_list is not None and len(interaction_list) > 0:
+        inter_np = np.asarray(interaction_list)
+        if inter_np.ndim != 2 or inter_np.shape[1] not in (2, 4):
+            raise ValueError("interaction_list must have shape (N, 2) or (N, 4)")
+
     if leaf_pairs is not None and len(leaf_pairs) > 0:
         leaf_pairs_np = np.asarray(leaf_pairs)
         if leaf_pairs_np.ndim != 2 or leaf_pairs_np.shape[1] != 2:
@@ -282,20 +302,33 @@ def execute_tree_correlation(
     xi_leaf = cp.zeros(d_leaves.shape[0], dtype=cp.complex128)
     w_leaf = cp.zeros(d_leaves.shape[0], dtype=cp.float64)
     
-    t_x = cp.asarray(tree['x'])
-    t_y = cp.asarray(tree['y'])
-    t_z = cp.asarray(tree['z'])
-    
     if d_inter.shape[0] > 0:
-        _tree_corr_kernel(
-            d_inter[:, 0],
-            d_inter[:, 1],
-            node_shear,
-            node_weight,
-            t_x, t_y, t_z,
-            xi_inter,
-            w_inter
-        )
+        if d_inter.shape[1] >= 4:
+            d_i = d_inter[:, 0].astype(cp.int32)
+            d_j = d_inter[:, 1].astype(cp.int32)
+            _tree_corr_precomputed_kernel(
+                d_i,
+                d_j,
+                node_shear,
+                node_weight,
+                d_inter[:, 2],
+                d_inter[:, 3],
+                xi_inter,
+                w_inter
+            )
+        else:
+            t_x = cp.asarray(tree['x'])
+            t_y = cp.asarray(tree['y'])
+            t_z = cp.asarray(tree['z'])
+            _tree_corr_kernel(
+                d_inter[:, 0],
+                d_inter[:, 1],
+                node_shear,
+                node_weight,
+                t_x, t_y, t_z,
+                xi_inter,
+                w_inter
+            )
         
     if d_leaves.shape[0] > 0:
         d_shear = cp.asarray(shear_map)
