@@ -13,16 +13,18 @@ def _push_stack(stack, ptr, node_a, node_b):
 def _traverse_numba(
     ax, ay, az, arad, achild_left, achild_right, astart, aend, aidx,
     bx, by, bz, brad, bchild_left, bchild_right, bstart, bend, bidx,
-    min_sep, max_sep, slop, is_auto,
+    min_sep, max_sep, nbins, slop, is_auto,
     max_stack, max_inter, max_leaf
 ):
     stack = np.empty((max_stack, 2), dtype=np.int32)
     stack_ptr = 0
     
-    interaction_list = np.empty((max_inter, 4), dtype=np.float64)
+    interaction_values = np.empty((max_inter, 4), dtype=np.float64)
+    interaction_bins = np.empty(max_inter, dtype=np.int32)
     inter_ptr = 0
     
     leaf_pairs = np.empty((max_leaf, 2), dtype=np.int64)
+    leaf_bins = np.empty(max_leaf, dtype=np.int32)
     leaf_ptr = 0
     
     # Push root
@@ -30,8 +32,9 @@ def _traverse_numba(
     stack[0, 1] = 0
     stack_ptr = 1
     
-    min_sep_sq = min_sep * min_sep
-    max_sep_sq = max_sep * max_sep
+    log_min_sep = np.log(min_sep)
+    bin_size = (np.log(max_sep) - log_min_sep) / nbins
+    inv_bin_size = 1.0 / bin_size
     
     while stack_ptr > 0:
         stack_ptr -= 1
@@ -54,9 +57,16 @@ def _traverse_numba(
             
         # Check 2: Approximation Criterion
         can_approximate = False
+        bin_k = -1
         if d > (ra + rb + slop):
             if d >= min_sep and d <= max_sep:
-                can_approximate = True
+                k = int((np.log(d) - log_min_sep) * inv_bin_size)
+                # Guard against roundoff for d ~= max_sep
+                if k == nbins:
+                    k = nbins - 1
+                if k >= 0 and k < nbins:
+                    can_approximate = True
+                    bin_k = k
                 
         if can_approximate:
             if inter_ptr < max_inter:
@@ -103,13 +113,14 @@ def _traverse_numba(
                 rot_re = np.cos(angle)
                 rot_im = np.sin(angle)
 
-                interaction_list[inter_ptr, 0] = float(i)
-                interaction_list[inter_ptr, 1] = float(j)
-                interaction_list[inter_ptr, 2] = rot_re
-                interaction_list[inter_ptr, 3] = rot_im
+                interaction_values[inter_ptr, 0] = float(i)
+                interaction_values[inter_ptr, 1] = float(j)
+                interaction_values[inter_ptr, 2] = rot_re
+                interaction_values[inter_ptr, 3] = rot_im
+                interaction_bins[inter_ptr] = bin_k
                 inter_ptr += 1
             else:
-                return interaction_list, leaf_pairs, -1
+                return interaction_values, interaction_bins, leaf_pairs, leaf_bins, -1
             continue
             
         # Check 3: Descend
@@ -117,6 +128,14 @@ def _traverse_numba(
         leaf_b = (bchild_left[j] == -1)
         
         if leaf_a and leaf_b:
+            if d < min_sep or d > max_sep:
+                continue
+            leaf_k = int((np.log(d) - log_min_sep) * inv_bin_size)
+            if leaf_k == nbins:
+                leaf_k = nbins - 1
+            if leaf_k < 0 or leaf_k >= nbins:
+                continue
+
             # Add all constituent pairs
             start_a = astart[i]
             end_a = aend[i]
@@ -137,9 +156,10 @@ def _traverse_numba(
                     if leaf_ptr < max_leaf:
                         leaf_pairs[leaf_ptr, 0] = idx_a
                         leaf_pairs[leaf_ptr, 1] = idx_b
+                        leaf_bins[leaf_ptr] = leaf_k
                         leaf_ptr += 1
                     else:
-                        return interaction_list, leaf_pairs, -2
+                        return interaction_values, interaction_bins, leaf_pairs, leaf_bins, -2
             continue
             
         # Split logic
@@ -164,7 +184,7 @@ def _traverse_numba(
                 
                 # Check stack overflow
                 if stack_ptr + 3 > max_stack:
-                    return interaction_list, leaf_pairs, -3
+                    return interaction_values, interaction_bins, leaf_pairs, leaf_bins, -3
                      
                 stack[stack_ptr, 0] = left
                 stack[stack_ptr, 1] = right
@@ -179,7 +199,7 @@ def _traverse_numba(
                 stack_ptr += 1
             else:
                 if stack_ptr + 2 > max_stack:
-                    return interaction_list, leaf_pairs, -3
+                    return interaction_values, interaction_bins, leaf_pairs, leaf_bins, -3
 
                 stack[stack_ptr, 0] = right
                 stack[stack_ptr, 1] = j
@@ -194,7 +214,7 @@ def _traverse_numba(
             right = bchild_right[j]
 
             if stack_ptr + 2 > max_stack:
-                return interaction_list, leaf_pairs, -3
+                return interaction_values, interaction_bins, leaf_pairs, leaf_bins, -3
 
             stack[stack_ptr, 0] = i
             stack[stack_ptr, 1] = right
@@ -204,13 +224,20 @@ def _traverse_numba(
             stack[stack_ptr, 1] = left
             stack_ptr += 1
             
-    return interaction_list[:inter_ptr], leaf_pairs[:leaf_ptr], 0
+    return (
+        interaction_values[:inter_ptr],
+        interaction_bins[:inter_ptr],
+        leaf_pairs[:leaf_ptr],
+        leaf_bins[:leaf_ptr],
+        0
+    )
 
 def traverse(
     tree_a,
     tree_b=None,
-    min_sep=0.0,
+    min_sep=1e-6,
     max_sep=1.0,
+    nbins=20,
     slop=0.0,
     max_stack=1000000,
     max_inter=10000000,
@@ -219,8 +246,15 @@ def traverse(
     max_retries=5
 ):
     """
-    Perform dual-tree traversal to find interaction pairs.
+    Perform dual-tree traversal to find interaction pairs and log-space bins.
     """
+    if min_sep <= 0.0:
+        raise ValueError("min_sep must be > 0 for logarithmic binning")
+    if max_sep <= min_sep:
+        raise ValueError("max_sep must be larger than min_sep")
+    if nbins <= 0:
+        raise ValueError("nbins must be a positive integer")
+
     is_auto = False
     if tree_b is None:
         tree_b = tree_a
@@ -255,18 +289,24 @@ def traverse(
     retries = 0
 
     while True:
-        inter, leaves, status = _traverse_numba(
+        inter_base, inter_bins, leaves, leaf_bins, status = _traverse_numba(
             ax, ay, az, arad, achild_left, achild_right, astart, aend, aidx,
             bx, by, bz, brad, bchild_left, bchild_right, bstart, bend, bidx,
-            min_sep, max_sep, float(slop), is_auto,
+            min_sep, max_sep, int(nbins), float(slop), is_auto,
             cur_stack, cur_inter, cur_leaf
         )
 
         if status == 0:
-            if inter.shape[0] > 0:
-                order = np.lexsort((inter[:, 1], inter[:, 0]))
-                inter = inter[order]
-            return inter, leaves
+            if inter_base.shape[0] > 0:
+                order = np.lexsort((inter_base[:, 1], inter_base[:, 0]))
+                inter_base = inter_base[order]
+                inter_bins = inter_bins[order]
+
+            interaction_list = np.empty((inter_base.shape[0], 5), dtype=np.float64)
+            if inter_base.shape[0] > 0:
+                interaction_list[:, :4] = inter_base
+                interaction_list[:, 4] = inter_bins
+            return interaction_list, inter_bins, leaves, leaf_bins
 
         if status == -1:
             print("Warning: Interaction list overflow, retrying with larger buffer")

@@ -26,26 +26,41 @@ def test_traverse_two_clusters():
     # d ~ 0.5. rA ~ 0.01, rB ~ 0.01.
     # 0.5 > 0.02 + 0.
     # Should get interaction pair (RootA, RootB).
-    inter, leaves = traverse(tree_a, tree_b, min_sep=0.1, max_sep=1.0, slop=0.0)
+    inter, inter_bins, leaves, leaf_bins = traverse(
+        tree_a, tree_b, min_sep=0.1, max_sep=1.0, nbins=8, slop=0.0
+    )
     
     assert len(inter) > 0
+    assert len(inter_bins) == len(inter)
     assert len(leaves) == 0
+    assert len(leaf_bins) == 0
     # Should be root-root interaction if approximation allowed
     # Roots are index 0.
     assert inter[0, 0] == 0
     assert inter[0, 1] == 0
-    assert inter.shape[1] == 4
+    assert inter.shape[1] == 5
     assert np.isfinite(inter[0, 2])
     assert np.isfinite(inter[0, 3])
+    assert np.issubdtype(inter_bins.dtype, np.integer)
+    assert np.all(inter_bins >= 0)
+    assert np.all(inter_bins < 8)
+    assert int(inter[0, 4]) == int(inter_bins[0])
     
     # 2. Approximation disallowed (large slop or small theta implied)
     # Force descent by setting slop large, e.g., 1.0.
     # d (0.5) < rA + rB + 1.0.
     # Should descend to leaves.
-    inter, leaves = traverse(tree_a, tree_b, min_sep=0.1, max_sep=1.0, slop=1.0)
+    inter, inter_bins, leaves, leaf_bins = traverse(
+        tree_a, tree_b, min_sep=0.1, max_sep=1.0, nbins=8, slop=1.0
+    )
     
     assert len(inter) == 0
+    assert len(inter_bins) == 0
     assert len(leaves) == 4 # 2x2 pairs
+    assert len(leaf_bins) == len(leaves)
+    assert np.issubdtype(leaf_bins.dtype, np.integer)
+    assert np.all(leaf_bins >= 0)
+    assert np.all(leaf_bins < 8)
     
     # Check leaf pairs
     # In traversal, leaves contains tree-order indices.
@@ -74,11 +89,15 @@ def test_interaction_list_format():
     tree_a = build_tree(ra_a, dec_a, w_a, min_size=0.0)
     tree_b = build_tree(ra_b, dec_b, w_b, min_size=0.0)
 
-    inter, leaves = traverse(tree_a, tree_b, min_sep=0.1, max_sep=1.0, slop=0.0)
+    inter, inter_bins, leaves, leaf_bins = traverse(
+        tree_a, tree_b, min_sep=0.1, max_sep=1.0, nbins=8, slop=0.0
+    )
 
     assert inter.ndim == 2
-    assert inter.shape[1] == 4
+    assert inter.shape[1] == 5
+    assert len(inter_bins) == len(inter)
     assert len(leaves) == 0
+    assert len(leaf_bins) == 0
 
 def test_auto_correlation_symmetry():
     # 4 points close to each other
@@ -91,7 +110,9 @@ def test_auto_correlation_symmetry():
     # Auto correlation
     # min_sep very small.
     # slop large to force leaves.
-    inter, leaves = traverse(tree, None, min_sep=0.0, max_sep=1.0, slop=1.0)
+    inter, inter_bins, leaves, leaf_bins = traverse(
+        tree, None, min_sep=1e-6, max_sep=1.0, nbins=8, slop=1.0
+    )
     
     # Should find all pairs (i, j) with i < j (since i==j avoided in code for auto)
     # Wait, code: `if is_auto and (i == j): start_kb = ka + 1`.
@@ -108,6 +129,9 @@ def test_auto_correlation_symmetry():
     # Plus maybe (0,0)? No, `start_kb = ka + 1`. Self-pairs excluded.
     
     assert len(leaves) == 6
+    assert len(inter) == 0
+    assert len(inter_bins) == 0
+    assert len(leaf_bins) == len(leaves)
     
     # Check indices (map tree-order back to original indices)
     found = set()
@@ -128,13 +152,22 @@ def test_range_limit():
     tree = build_tree(ra, dec, w, min_size=0.0)
     
     # Max sep 0.5
-    inter, leaves = traverse(tree, None, min_sep=0.0, max_sep=0.5, slop=1.0)
+    inter, inter_bins, leaves, leaf_bins = traverse(
+        tree, None, min_sep=1e-6, max_sep=0.5, nbins=8, slop=1.0
+    )
     assert len(leaves) == 0
     assert len(inter) == 0
+    assert len(inter_bins) == 0
+    assert len(leaf_bins) == 0
     
     # Min sep 0.5, Max 1.5
-    inter, leaves = traverse(tree, None, min_sep=0.5, max_sep=1.5, slop=1.0)
+    inter, inter_bins, leaves, leaf_bins = traverse(
+        tree, None, min_sep=0.5, max_sep=1.5, nbins=8, slop=1.0
+    )
     assert len(leaves) == 1 # (0, 1)
+    assert len(inter) == 0
+    assert len(inter_bins) == 0
+    assert len(leaf_bins) == 1
 
 if __name__ == "__main__":
     test_traverse_two_clusters()
