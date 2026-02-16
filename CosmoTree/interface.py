@@ -48,18 +48,20 @@ class CosmoTree:
     def is_preprocessed(self):
         return self._geometry is not None
 
-    def _set_geometry(self, tree, interaction_list, interaction_bins, leaf_pairs, leaf_bins):
+    def _set_geometry(self, tree, interaction_list, interaction_bins, leaf_pairs, leaf_bins, ra=None, dec=None):
         self._geometry = {
             "tree": tree,
             "interaction_list": interaction_list,
             "interaction_bins": interaction_bins,
             "leaf_pairs": leaf_pairs,
             "leaf_bins": leaf_bins,
+            "ra": None if ra is None else np.ascontiguousarray(np.asarray(ra, dtype=np.float64)),
+            "dec": None if dec is None else np.ascontiguousarray(np.asarray(dec, dtype=np.float64)),
         }
 
     def _set_coords_cache(self, ra=None, dec=None, particle_coords=None):
-        self._ra = None if ra is None else np.asarray(ra)
-        self._dec = None if dec is None else np.asarray(dec)
+        self._ra = None if ra is None else np.ascontiguousarray(np.asarray(ra, dtype=np.float64))
+        self._dec = None if dec is None else np.ascontiguousarray(np.asarray(dec, dtype=np.float64))
         self._particle_coords = particle_coords
 
     def _parse_geometry_input(self, geometry_data):
@@ -108,6 +110,8 @@ class CosmoTree:
                 interaction_bins=np.ascontiguousarray(interaction_bins, dtype=np.int32),
                 leaf_pairs=np.ascontiguousarray(leaf_pairs, dtype=np.int64),
                 leaf_bins=np.ascontiguousarray(leaf_bins, dtype=np.int32),
+                ra=ra,
+                dec=dec,
             )
             self._set_coords_cache(ra=ra, dec=dec, particle_coords=particle_coords)
             return self
@@ -156,6 +160,8 @@ class CosmoTree:
             interaction_bins=np.ascontiguousarray(interaction_bins, dtype=np.int32),
             leaf_pairs=np.ascontiguousarray(leaf_pairs, dtype=np.int64),
             leaf_bins=np.ascontiguousarray(leaf_bins, dtype=np.int32),
+            ra=ra,
+            dec=dec,
         )
         self._set_coords_cache(ra=ra, dec=dec, particle_coords=None)
         return self
@@ -222,6 +228,9 @@ class CosmoTree:
             "max_depth": self.max_depth,
             "leaf_bins": self._geometry["leaf_bins"],
         }
+        if self._ra is not None and self._dec is not None:
+            config["ra"] = self._ra
+            config["dec"] = self._dec
         save_geometry(
             filename=filename,
             tree=self._geometry["tree"],
@@ -239,8 +248,10 @@ class CosmoTree:
             interaction_bins=interaction_bins,
             leaf_pairs=leaf_pairs,
             leaf_bins=leaf_bins,
+            ra=config.get("ra"),
+            dec=config.get("dec"),
         )
-        self._set_coords_cache(ra=None, dec=None, particle_coords=None)
+        self._set_coords_cache(ra=config.get("ra"), dec=config.get("dec"), particle_coords=None)
 
         self.nbins = int(config["nbins"])
         self.min_sep = float(config["min_sep"])

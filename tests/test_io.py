@@ -32,11 +32,11 @@ def _build_geometry():
     inter, inter_bins, leaf_pairs, leaf_bins = traverse(
         tree, None, min_sep=1e-6, max_sep=1.0, nbins=8, bin_slop=0.0
     )
-    return tree, inter, inter_bins, leaf_pairs, leaf_bins
+    return tree, inter, inter_bins, leaf_pairs, leaf_bins, ra, dec
 
 
 def test_geometry_roundtrip_preserves_arrays_and_dtypes(tmp_path):
-    tree, inter, inter_bins, leaf_pairs, leaf_bins = _build_geometry()
+    tree, inter, inter_bins, leaf_pairs, leaf_bins, ra, dec = _build_geometry()
 
     filename = tmp_path / "geometry.h5"
     config = {
@@ -45,6 +45,8 @@ def test_geometry_roundtrip_preserves_arrays_and_dtypes(tmp_path):
         "max_sep": 1.0,
         "slop": 1.0,
         "leaf_bins": leaf_bins,
+        "ra": ra,
+        "dec": dec,
     }
     save_geometry(filename, tree, inter, leaf_pairs, config)
 
@@ -69,10 +71,12 @@ def test_geometry_roundtrip_preserves_arrays_and_dtypes(tmp_path):
     assert np.isclose(config2["max_sep"], 1.0)
     assert np.isclose(config2["slop"], 1.0)
     assert config2["leaf_bins"].dtype == np.int32
+    np.testing.assert_array_equal(config2["ra"], ra)
+    np.testing.assert_array_equal(config2["dec"], dec)
 
 
 def test_save_geometry_requires_leaf_bins_when_leaf_pairs_present(tmp_path):
-    tree, inter, _, leaf_pairs, _ = _build_geometry()
+    tree, inter, _, leaf_pairs, _, _, _ = _build_geometry()
     filename = tmp_path / "geometry_missing_leaf_bins.h5"
 
     with pytest.raises(ValueError, match="leaf_bins"):
@@ -86,7 +90,7 @@ def test_save_geometry_requires_leaf_bins_when_leaf_pairs_present(tmp_path):
 
 
 def test_save_geometry_normalizes_tree_dtypes(tmp_path):
-    tree, inter, inter_bins, leaf_pairs, leaf_bins = _build_geometry()
+    tree, inter, inter_bins, leaf_pairs, leaf_bins, _, _ = _build_geometry()
     filename = tmp_path / "geometry_casts.h5"
 
     tree_mixed = {

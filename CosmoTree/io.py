@@ -21,7 +21,7 @@ _TREE_DTYPES = {
 }
 
 _META_KEYS = ("nbins", "min_sep", "max_sep")
-_NON_ATTR_CONFIG_KEYS = {"leaf_bins"}
+_NON_ATTR_CONFIG_KEYS = {"leaf_bins", "ra", "dec"}
 
 
 def _require_h5py():
@@ -117,6 +117,26 @@ def _normalize_leaf_bins(config, n_leaf, nbins):
     return np.ascontiguousarray(leaf_bins)
 
 
+def _normalize_optional_radec(config, n_pix):
+    ra_val = config.get("ra")
+    dec_val = config.get("dec")
+
+    has_ra = ra_val is not None
+    has_dec = dec_val is not None
+    if has_ra != has_dec:
+        raise ValueError("config must provide both 'ra' and 'dec' together")
+    if not has_ra:
+        return None, None
+
+    ra = np.asarray(ra_val, dtype=np.float64)
+    dec = np.asarray(dec_val, dtype=np.float64)
+    if ra.ndim != 1 or dec.ndim != 1:
+        raise ValueError("config['ra'] and config['dec'] must be 1D arrays")
+    if ra.shape[0] != n_pix or dec.shape[0] != n_pix:
+        raise ValueError("config['ra'] and config['dec'] lengths must match number of pixels")
+    return np.ascontiguousarray(ra), np.ascontiguousarray(dec)
+
+
 def save_geometry(filename, tree, interaction_list, leaf_pairs, config):
     """
     Save tree traversal geometry to an HDF5 file.
@@ -134,6 +154,8 @@ def save_geometry(filename, tree, interaction_list, leaf_pairs, config):
     inter, inter_bins = _normalize_interactions(interaction_list, nbins)
     leaf_pairs_norm = _normalize_leaf_pairs(leaf_pairs)
     leaf_bins = _normalize_leaf_bins(config, leaf_pairs_norm.shape[0], nbins)
+    n_pix = tree_norm["idx_array"].shape[0]
+    ra_arr, dec_arr = _normalize_optional_radec(config, n_pix)
 
     with h5py.File(filename, "w") as f:
         f.attrs["format"] = "cosmotree_geometry"
@@ -158,6 +180,11 @@ def save_geometry(filename, tree, interaction_list, leaf_pairs, config):
         grp_trav.create_dataset("interaction_bins", data=inter_bins, dtype=np.int32)
         grp_trav.create_dataset("leaf_pairs", data=leaf_pairs_norm, dtype=np.int64)
         grp_trav.create_dataset("leaf_bins", data=leaf_bins, dtype=np.int32)
+
+        if ra_arr is not None:
+            grp_coords = f.create_group("coords")
+            grp_coords.create_dataset("ra", data=ra_arr, dtype=np.float64)
+            grp_coords.create_dataset("dec", data=dec_arr, dtype=np.float64)
 
 
 def load_geometry(filename):
@@ -195,6 +222,7 @@ def load_geometry(filename):
             if arr.ndim != 1:
                 raise ValueError(f"tree dataset '{key}' must be 1D")
             tree[key] = np.ascontiguousarray(arr)
+        n_pix = tree["idx_array"].shape[0]
 
         if "traversal" not in f:
             raise ValueError("missing 'traversal' group in geometry file")
@@ -231,5 +259,21 @@ def load_geometry(filename):
             raise ValueError("leaf_bins must be 1D and aligned with leaf_pairs")
         leaf_bins = np.ascontiguousarray(leaf_bins)
         config["leaf_bins"] = leaf_bins
+
+        if "coords" in f:
+            grp_coords = f["coords"]
+            has_ra = "ra" in grp_coords
+            has_dec = "dec" in grp_coords
+            if has_ra != has_dec:
+                raise ValueError("coords group must include both 'ra' and 'dec' datasets")
+            if has_ra:
+                ra = np.asarray(grp_coords["ra"][()], dtype=np.float64)
+                dec = np.asarray(grp_coords["dec"][()], dtype=np.float64)
+                if ra.ndim != 1 or dec.ndim != 1:
+                    raise ValueError("coords ra/dec datasets must be 1D")
+                if ra.shape[0] != n_pix or dec.shape[0] != n_pix:
+                    raise ValueError("coords ra/dec lengths must match number of pixels")
+                config["ra"] = np.ascontiguousarray(ra)
+                config["dec"] = np.ascontiguousarray(dec)
 
     return tree, interaction_list, interaction_bins, leaf_pairs, leaf_bins, config

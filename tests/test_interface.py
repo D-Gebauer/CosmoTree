@@ -29,6 +29,8 @@ def test_cosmotree_preprocess_and_process():
     ct = CosmoTree(min_sep=1e-6, max_sep=1.0, nbins=8, bin_slop=0.0, dtype=np.float32)
     ct.preprocess({"ra": ra, "dec": dec, "w": w})
     assert ct.is_preprocessed
+    np.testing.assert_array_equal(ct._geometry["ra"], ra)
+    np.testing.assert_array_equal(ct._geometry["dec"], dec)
 
     corr = ct.process(maps, w_map=w)
     assert corr.shape == (1, 1, 8)
@@ -50,9 +52,10 @@ def test_cosmotree_save_and_load_roundtrip(tmp_path):
     assert np.isclose(ct_loaded.min_sep, 1e-6)
     assert np.isclose(ct_loaded.max_sep, 1.0)
     assert ct_loaded.is_preprocessed
+    np.testing.assert_array_equal(ct_loaded._geometry["ra"], ra)
+    np.testing.assert_array_equal(ct_loaded._geometry["dec"], dec)
 
-    # Loaded geometry does not include ra/dec by default, so provide them here.
-    corr = ct_loaded.process(maps, w_map=w, ra=ra, dec=dec, dtype=np.float64)
+    # ra/dec are persisted in geometry and restored by load().
+    corr = ct_loaded.process(maps, w_map=w, dtype=np.float64)
     assert corr.shape == (1, 1, 8)
     assert corr.dtype == np.float64
-
