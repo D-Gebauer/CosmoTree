@@ -1,6 +1,17 @@
 import numpy as np
 from numba import njit, float64, int32, int64
 
+
+def _normalize_metric(metric):
+    if isinstance(metric, str):
+        m = metric.strip().lower()
+        if m in ("euclidean", "chord"):
+            return "euclidean"
+        if m in ("arc", "great_circle", "great-circle", "greatcircle"):
+            return "arc"
+    raise ValueError("metric must be one of: 'Euclidean', 'Arc'")
+
+
 @njit(fastmath=True)
 def _angular_to_cartesian(ra, dec):
     """
@@ -343,15 +354,16 @@ def _build_tree_numba(x, y, z, w, min_size_sq, max_depth):
         idx_array
     )
 
-def build_tree(ra, dec, w=None, min_size=0.0, max_depth=-1):
+def build_tree(ra, dec, w=None, min_size=0.0, max_depth=-1, metric="Euclidean"):
     """
     Build a Ball Tree from RA/Dec/Weight.
     
     Args:
         ra, dec: arrays of coordinates in radians.
         w: array of weights (optional, defaults to 1).
-        min_size: minimum node size (radius) to split.
+        min_size: minimum node size to split (interpreted in selected metric).
         max_depth: maximum depth of the tree.
+        metric: 'Euclidean' (chord) or 'Arc' (great-circle).
         
     Returns:
         Dictionary containing flat arrays:
@@ -364,11 +376,23 @@ def build_tree(ra, dec, w=None, min_size=0.0, max_depth=-1):
         - node_start, node_end (indices into idx_array)
         - idx_array (reordered particle indices)
     """
+    metric_name = _normalize_metric(metric)
+
+    if min_size < 0.0:
+        raise ValueError("min_size must be >= 0")
+    if metric_name == "arc":
+        if min_size > np.pi:
+            raise ValueError("for Arc metric, min_size must be <= pi")
+        # Tree geometry is built in Cartesian space; convert user arc threshold to chord.
+        min_size_internal = 2.0 * np.sin(0.5 * min_size)
+    else:
+        min_size_internal = float(min_size)
+
     if w is None:
         w = np.ones_like(ra)
         
     x, y, z = _angular_to_cartesian(ra, dec)
-    min_size_sq = min_size * min_size
+    min_size_sq = min_size_internal * min_size_internal
     
     (parents, left, right, nx, ny, nz, nr, nw, nstart, nend, idx) = _build_tree_numba(
         x, y, z, w, min_size_sq, max_depth

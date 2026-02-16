@@ -1,5 +1,36 @@
 import numpy as np
 from numba import njit, float64, int32, int64
+from enum import IntEnum
+
+
+class Metric(IntEnum):
+    EUCLIDEAN = 0
+    ARC = 1
+
+
+def _parse_metric(metric):
+    if isinstance(metric, Metric):
+        return int(metric), "euclidean" if metric == Metric.EUCLIDEAN else "arc"
+
+    if isinstance(metric, (int, np.integer)):
+        metric_int = int(metric)
+        if metric_int == int(Metric.EUCLIDEAN):
+            return metric_int, "euclidean"
+        if metric_int == int(Metric.ARC):
+            return metric_int, "arc"
+
+    if isinstance(metric, str):
+        metric_name = metric.strip().lower()
+        if metric_name in ("euclidean", "chord"):
+            return int(Metric.EUCLIDEAN), "euclidean"
+        if metric_name in ("arc", "great_circle", "great-circle", "greatcircle"):
+            return int(Metric.ARC), "arc"
+
+    raise ValueError("metric must be one of: 'Euclidean', 'Arc'")
+
+
+def _arc_to_chord(theta):
+    return 2.0 * np.sin(0.5 * theta)
 
 @njit(fastmath=True)
 def _push_stack(stack, ptr, node_a, node_b):
@@ -13,7 +44,7 @@ def _push_stack(stack, ptr, node_a, node_b):
 def _traverse_numba(
     ax, ay, az, arad, achild_left, achild_right, astart, aend, aidx,
     bx, by, bz, brad, bchild_left, bchild_right, bstart, bend, bidx,
-    min_sep, max_sep, nbins, slop, is_auto,
+    min_sep_chord, max_sep_chord, min_sep_bin, max_sep_bin, nbins, slopeff, is_auto, metric_code,
     max_stack, max_inter, max_leaf
 ):
     stack = np.empty((max_stack, 2), dtype=np.int32)
@@ -32,8 +63,8 @@ def _traverse_numba(
     stack[0, 1] = 0
     stack_ptr = 1
     
-    log_min_sep = np.log(min_sep)
-    bin_size = (np.log(max_sep) - log_min_sep) / nbins
+    log_min_sep = np.log(min_sep_bin)
+    bin_size = (np.log(max_sep_bin) - log_min_sep) / nbins
     inv_bin_size = 1.0 / bin_size
     
     while stack_ptr > 0:
@@ -51,16 +82,27 @@ def _traverse_numba(
         d = np.sqrt(dsq)
         
         # Check 1: Range overlap
-        # If [d - ra - rb, d + ra + rb] intersects [min_sep, max_sep]
-        if (d - ra - rb > max_sep) or (d + ra + rb < min_sep):
+        # If [d - ra - rb, d + ra + rb] intersects [min_sep_chord, max_sep_chord]
+        if (d - ra - rb > max_sep_chord) or (d + ra + rb < min_sep_chord):
             continue
             
         # Check 2: Approximation Criterion
         can_approximate = False
         bin_k = -1
-        if d > (ra + rb + slop):
-            if d >= min_sep and d <= max_sep:
-                k = int((np.log(d) - log_min_sep) * inv_bin_size)
+        # TreeCorr-style approximation criterion:
+        # d > (ra + rb) / slopeff, where slopeff = min(bin_slop, angle_slop).
+        #
+        # Fallback for tiny separations: always descend so we do not accept
+        # approximations when node centers nearly coincide.
+        if slopeff > 0.0 and d > 1e-15:
+            if d > ((ra + rb) / slopeff) and d >= min_sep_chord and d <= max_sep_chord:
+                d_for_bin = d
+                if metric_code == 1:
+                    half_d = 0.5 * d
+                    if half_d > 1.0:
+                        half_d = 1.0
+                    d_for_bin = 2.0 * np.arcsin(half_d)
+                k = int((np.log(d_for_bin) - log_min_sep) * inv_bin_size)
                 # Guard against roundoff for d ~= max_sep
                 if k == nbins:
                     k = nbins - 1
@@ -128,9 +170,15 @@ def _traverse_numba(
         leaf_b = (bchild_left[j] == -1)
         
         if leaf_a and leaf_b:
-            if d < min_sep or d > max_sep:
+            if d < min_sep_chord or d > max_sep_chord:
                 continue
-            leaf_k = int((np.log(d) - log_min_sep) * inv_bin_size)
+            d_for_bin = d
+            if metric_code == 1:
+                half_d = 0.5 * d
+                if half_d > 1.0:
+                    half_d = 1.0
+                d_for_bin = 2.0 * np.arcsin(half_d)
+            leaf_k = int((np.log(d_for_bin) - log_min_sep) * inv_bin_size)
             if leaf_k == nbins:
                 leaf_k = nbins - 1
             if leaf_k < 0 or leaf_k >= nbins:
@@ -238,7 +286,9 @@ def traverse(
     min_sep=1e-6,
     max_sep=1.0,
     nbins=20,
-    slop=0.0,
+    metric="Euclidean",
+    bin_slop=0.1,
+    angle_slop=1.0,
     max_stack=1000000,
     max_inter=10000000,
     max_leaf=10000000,
@@ -247,6 +297,9 @@ def traverse(
 ):
     """
     Perform dual-tree traversal to find interaction pairs and log-space bins.
+    metric can be 'Euclidean' (chord) or 'Arc' (great-circle).
+    Approximation criterion uses TreeCorr-style slopeff = min(bin_slop, angle_slop):
+    d > (ra + rb) / slopeff.
     """
     if min_sep <= 0.0:
         raise ValueError("min_sep must be > 0 for logarithmic binning")
@@ -254,6 +307,26 @@ def traverse(
         raise ValueError("max_sep must be larger than min_sep")
     if nbins <= 0:
         raise ValueError("nbins must be a positive integer")
+    if bin_slop < 0.0:
+        raise ValueError("bin_slop must be >= 0")
+    if angle_slop < 0.0:
+        raise ValueError("angle_slop must be >= 0")
+
+    slopeff = float(min(bin_slop, angle_slop))
+
+    metric_code, metric_name = _parse_metric(metric)
+    if metric_name == "arc":
+        if max_sep > np.pi:
+            raise ValueError("for Arc metric, max_sep must be <= pi")
+        min_sep_chord = _arc_to_chord(min_sep)
+        max_sep_chord = _arc_to_chord(max_sep)
+        min_sep_bin = min_sep
+        max_sep_bin = max_sep
+    else:
+        min_sep_chord = float(min_sep)
+        max_sep_chord = float(max_sep)
+        min_sep_bin = float(min_sep)
+        max_sep_bin = float(max_sep)
 
     is_auto = False
     if tree_b is None:
@@ -292,7 +365,8 @@ def traverse(
         inter_base, inter_bins, leaves, leaf_bins, status = _traverse_numba(
             ax, ay, az, arad, achild_left, achild_right, astart, aend, aidx,
             bx, by, bz, brad, bchild_left, bchild_right, bstart, bend, bidx,
-            min_sep, max_sep, int(nbins), float(slop), is_auto,
+            float(min_sep_chord), float(max_sep_chord), float(min_sep_bin), float(max_sep_bin), int(nbins),
+            float(slopeff), is_auto, int(metric_code),
             cur_stack, cur_inter, cur_leaf
         )
 

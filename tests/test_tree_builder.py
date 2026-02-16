@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 from CosmoTree.tree import build_tree
 
 def test_build_tree_basics():
@@ -113,8 +114,20 @@ def test_max_depth():
             
     assert max_d <= 2
 
+
+def test_build_tree_arc_metric_and_validation():
+    ra = np.array([0.0, 0.3, 0.6], dtype=np.float64)
+    dec = np.array([0.0, 0.0, 0.0], dtype=np.float64)
+    tree = build_tree(ra, dec, min_size=0.1, metric="Arc")
+    assert "radius" in tree
+    assert tree["radius"].dtype == np.float64
+
+    with pytest.raises(ValueError, match="<= pi"):
+        build_tree(ra, dec, min_size=np.pi + 1e-3, metric="Arc")
+
 if __name__ == "__main__":
     test_build_tree_basics()
     test_build_tree_large_random()
     test_max_depth()
+    test_build_tree_arc_metric_and_validation()
     print("All tests passed")

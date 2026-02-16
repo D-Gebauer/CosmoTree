@@ -1,58 +1,46 @@
 import numpy as np
 import warnings
+from functools import lru_cache
 
 try:
     import cupy as cp
 
-    _leaf_sum_kernel = cp.ElementwiseKernel(
-        "int64 start, int64 end, raw int64 idx_array, raw complex128 g_pix, raw float64 w_pix",
-        "complex128 g_node, float64 w_node",
-        """
-        thrust::complex<double> g_sum = 0;
-        double w_sum = 0;
+    _LEAF_SUM_TEMPLATE = """
+        thrust::complex<$REAL$> g_sum = 0;
+        $REAL$ w_sum = 0;
         for (long long i = start; i < end; ++i) {
             long long idx = idx_array[i];
-            double w = w_pix[idx];
-            thrust::complex<double> val = g_pix[idx];
+            $REAL$ w = w_pix[idx];
+            thrust::complex<$REAL$> val = g_pix[idx];
             g_sum += val * w;
             w_sum += w;
         }
         g_node = g_sum;
         w_node = w_sum;
-        """,
-        "leaf_sum_kernel",
-        preamble="#include <thrust/complex.h>",
-    )
+    """
 
-    _node_agg_kernel = cp.ElementwiseKernel(
-        "int32 left, int32 right, raw complex128 node_shear, raw float64 node_weight",
-        "complex128 g_parent, float64 w_parent",
-        """
-        thrust::complex<double> gl = node_shear[left];
-        thrust::complex<double> gr = node_shear[right];
+    _NODE_AGG_TEMPLATE = """
+        thrust::complex<$REAL$> gl = node_shear[left];
+        thrust::complex<$REAL$> gr = node_shear[right];
         g_parent = gl + gr;
         w_parent = node_weight[left] + node_weight[right];
-        """,
-        "node_agg_kernel",
-        preamble="#include <thrust/complex.h>",
-    )
+    """
 
-    _tomo_interaction_kernel = cp.RawKernel(
-        r"""
+    _TOMO_INTERACTION_TEMPLATE = r"""
         #include <cuComplex.h>
         extern "C" __global__
         void tomo_interaction_kernel(
             const int* i_idx,
             const int* j_idx,
-            const double* rot_re,
-            const double* rot_im,
+            const $REAL$* rot_re,
+            const $REAL$* rot_im,
             const int* bins,
-            const cuDoubleComplex* node_shear,
+            const $COMPLEX$* node_shear,
             const int n_tomo,
             const int n_nodes,
             const int n_bins,
             const long long n_inter,
-            double* out
+            $REAL$* out
         ) {
             const long long tid = (long long)blockIdx.x * blockDim.x + threadIdx.x;
             if (tid >= n_inter) return;
@@ -62,26 +50,23 @@ try:
             const int bin = bins[tid];
             if (i < 0 || j < 0 || i >= n_nodes || j >= n_nodes || bin < 0 || bin >= n_bins) return;
 
-            const double rr = rot_re[tid];
-            const double ri = rot_im[tid];
+            const $REAL$ rr = rot_re[tid];
+            const $REAL$ ri = rot_im[tid];
             for (int a = 0; a < n_tomo; ++a) {
-                const cuDoubleComplex gi = node_shear[(long long)a * n_nodes + i];
+                const $COMPLEX$ gi = node_shear[(long long)a * n_nodes + i];
                 for (int b = a; b < n_tomo; ++b) {
-                    const cuDoubleComplex gj = node_shear[(long long)b * n_nodes + j];
-                    const double prod_re = gi.x * gj.x + gi.y * gj.y;
-                    const double prod_im = gi.y * gj.x - gi.x * gj.y;
-                    const double val = prod_re * rr - prod_im * ri;
+                    const $COMPLEX$ gj = node_shear[(long long)b * n_nodes + j];
+                    const $REAL$ prod_re = gi.x * gj.x + gi.y * gj.y;
+                    const $REAL$ prod_im = gi.y * gj.x - gi.x * gj.y;
+                    const $REAL$ val = prod_re * rr - prod_im * ri;
                     const long long out_idx = ((long long)a * n_tomo + b) * n_bins + bin;
                     atomicAdd(out + out_idx, val);
                 }
             }
         }
-        """,
-        "tomo_interaction_kernel",
-    )
+    """
 
-    _tomo_leaf_kernel = cp.RawKernel(
-        r"""
+    _TOMO_LEAF_TEMPLATE = r"""
         #include <cuComplex.h>
         #include <math.h>
         extern "C" __global__
@@ -89,16 +74,16 @@ try:
             const long long* idx_a,
             const long long* idx_b,
             const int* bins,
-            const cuDoubleComplex* g_pix,
-            const double* w_pix,
-            const double* px,
-            const double* py,
-            const double* pz,
+            const $COMPLEX$* g_pix,
+            const $REAL$* w_pix,
+            const $REAL$* px,
+            const $REAL$* py,
+            const $REAL$* pz,
             const int n_tomo,
             const int n_pix,
             const int n_bins,
             const long long n_pairs,
-            double* out
+            $REAL$* out
         ) {
             const long long tid = (long long)blockIdx.x * blockDim.x + threadIdx.x;
             if (tid >= n_pairs) return;
@@ -108,78 +93,119 @@ try:
             const int bin = bins[tid];
             if (ia < 0 || ib < 0 || ia >= n_pix || ib >= n_pix || bin < 0 || bin >= n_bins) return;
 
-            const double ax = px[ia];
-            const double ay = py[ia];
-            const double az = pz[ia];
-            const double bx = px[ib];
-            const double by = py[ib];
-            const double bz = pz[ib];
+            const $REAL$ ax = px[ia];
+            const $REAL$ ay = py[ia];
+            const $REAL$ az = pz[ia];
+            const $REAL$ bx = px[ib];
+            const $REAL$ by = py[ib];
+            const $REAL$ bz = pz[ib];
 
-            const double r2 = ax * ax + ay * ay;
-            const double r = sqrt(r2);
-            double ux, uy, uz;
-            double vx, vy, vz;
-            if (r > 1e-9) {
-                const double cos_ra = ax / r;
-                const double sin_ra = ay / r;
-                const double cos_dec = r;
-                const double sin_dec = az;
+            const $REAL$ r2 = ax * ax + ay * ay;
+            const $REAL$ r = sqrt(r2);
+            $REAL$ ux, uy, uz;
+            $REAL$ vx, vy, vz;
+            if (r > ($REAL$)1e-9) {
+                const $REAL$ cos_ra = ax / r;
+                const $REAL$ sin_ra = ay / r;
+                const $REAL$ cos_dec = r;
+                const $REAL$ sin_dec = az;
                 ux = -sin_ra;
                 uy = cos_ra;
-                uz = 0.0;
+                uz = ($REAL$)0.0;
                 vx = -sin_dec * cos_ra;
                 vy = -sin_dec * sin_ra;
                 vz = cos_dec;
             } else {
-                ux = 1.0;
-                uy = 0.0;
-                uz = 0.0;
-                vx = 0.0;
-                vy = 1.0;
-                vz = 0.0;
+                ux = ($REAL$)1.0;
+                uy = ($REAL$)0.0;
+                uz = ($REAL$)0.0;
+                vx = ($REAL$)0.0;
+                vy = ($REAL$)1.0;
+                vz = ($REAL$)0.0;
             }
 
-            const double dx = bx - ax;
-            const double dy = by - ay;
-            const double dz = bz - az;
-            const double xp = dx * ux + dy * uy + dz * uz;
-            const double yp = dx * vx + dy * vy + dz * vz;
-            const double phi = atan2(yp, xp);
-            const double angle = -2.0 * phi;
-            const double rr = cos(angle);
-            const double ri = sin(angle);
+            const $REAL$ dx = bx - ax;
+            const $REAL$ dy = by - ay;
+            const $REAL$ dz = bz - az;
+            const $REAL$ xp = dx * ux + dy * uy + dz * uz;
+            const $REAL$ yp = dx * vx + dy * vy + dz * vz;
+            const $REAL$ phi = atan2(yp, xp);
+            const $REAL$ angle = ($REAL$)(-2.0) * phi;
+            const $REAL$ rr = cos(angle);
+            const $REAL$ ri = sin(angle);
 
             for (int a = 0; a < n_tomo; ++a) {
                 const long long base_a = (long long)a * n_pix;
-                const cuDoubleComplex ga = g_pix[base_a + ia];
-                const double wa = w_pix[base_a + ia];
+                const $COMPLEX$ ga = g_pix[base_a + ia];
+                const $REAL$ wa = w_pix[base_a + ia];
                 for (int b = a; b < n_tomo; ++b) {
                     const long long base_b = (long long)b * n_pix;
-                    const cuDoubleComplex gb = g_pix[base_b + ib];
-                    const double wb = w_pix[base_b + ib];
+                    const $COMPLEX$ gb = g_pix[base_b + ib];
+                    const $REAL$ wb = w_pix[base_b + ib];
 
-                    const double gax = wa * ga.x;
-                    const double gay = wa * ga.y;
-                    const double gbx = wb * gb.x;
-                    const double gby = wb * gb.y;
-                    const double prod_re = gax * gbx + gay * gby;
-                    const double prod_im = gay * gbx - gax * gby;
-                    const double val = prod_re * rr - prod_im * ri;
+                    const $REAL$ gax = wa * ga.x;
+                    const $REAL$ gay = wa * ga.y;
+                    const $REAL$ gbx = wb * gb.x;
+                    const $REAL$ gby = wb * gb.y;
+                    const $REAL$ prod_re = gax * gbx + gay * gby;
+                    const $REAL$ prod_im = gay * gbx - gax * gby;
+                    const $REAL$ val = prod_re * rr - prod_im * ri;
                     const long long out_idx = ((long long)a * n_tomo + b) * n_bins + bin;
                     atomicAdd(out + out_idx, val);
                 }
             }
         }
-        """,
-        "tomo_leaf_kernel",
-    )
+    """
+
+    @lru_cache(maxsize=2)
+    def _get_precision_kernels(real_dtype_name):
+        if real_dtype_name == "float32":
+            complex_dtype_name = "complex64"
+            c_real = "float"
+            c_complex = "cuFloatComplex"
+        elif real_dtype_name == "float64":
+            complex_dtype_name = "complex128"
+            c_real = "double"
+            c_complex = "cuDoubleComplex"
+        else:
+            raise ValueError(f"Unsupported real dtype '{real_dtype_name}'")
+
+        leaf_sum_kernel = cp.ElementwiseKernel(
+            f"int64 start, int64 end, raw int64 idx_array, raw {complex_dtype_name} g_pix, raw {real_dtype_name} w_pix",
+            f"{complex_dtype_name} g_node, {real_dtype_name} w_node",
+            _LEAF_SUM_TEMPLATE.replace("$REAL$", c_real),
+            f"leaf_sum_kernel_{real_dtype_name}",
+            preamble="#include <thrust/complex.h>",
+        )
+
+        node_agg_kernel = cp.ElementwiseKernel(
+            f"int32 left, int32 right, raw {complex_dtype_name} node_shear, raw {real_dtype_name} node_weight",
+            f"{complex_dtype_name} g_parent, {real_dtype_name} w_parent",
+            _NODE_AGG_TEMPLATE.replace("$REAL$", c_real),
+            f"node_agg_kernel_{real_dtype_name}",
+            preamble="#include <thrust/complex.h>",
+        )
+
+        interaction_kernel = cp.RawKernel(
+            _TOMO_INTERACTION_TEMPLATE.replace("$REAL$", c_real).replace("$COMPLEX$", c_complex),
+            f"tomo_interaction_kernel_{real_dtype_name}",
+        )
+
+        leaf_kernel = cp.RawKernel(
+            _TOMO_LEAF_TEMPLATE.replace("$REAL$", c_real).replace("$COMPLEX$", c_complex),
+            f"tomo_leaf_kernel_{real_dtype_name}",
+        )
+
+        return {
+            "leaf_sum": leaf_sum_kernel,
+            "node_agg": node_agg_kernel,
+            "interaction": interaction_kernel,
+            "leaf": leaf_kernel,
+        }
 
 except ImportError:
     cp = None
-    _leaf_sum_kernel = None
-    _node_agg_kernel = None
-    _tomo_interaction_kernel = None
-    _tomo_leaf_kernel = None
+    _get_precision_kernels = None
 
 
 def _get_levels(parents):
@@ -195,8 +221,29 @@ def _get_levels(parents):
     return levels
 
 
-def _normalize_maps(maps):
-    maps_np = np.asarray(maps, dtype=np.float64)
+def _resolve_precision(dtype):
+    np_dtype = np.dtype(dtype)
+    if np_dtype == np.float32:
+        return {
+            "np_real": np.float32,
+            "np_complex": np.complex64,
+            "np_real_name": "float32",
+            "cp_real": cp.float32 if cp is not None else None,
+            "cp_complex": cp.complex64 if cp is not None else None,
+        }
+    if np_dtype == np.float64:
+        return {
+            "np_real": np.float64,
+            "np_complex": np.complex128,
+            "np_real_name": "float64",
+            "cp_real": cp.float64 if cp is not None else None,
+            "cp_complex": cp.complex128 if cp is not None else None,
+        }
+    raise ValueError("dtype must be np.float32 or np.float64")
+
+
+def _normalize_maps(maps, real_dtype):
+    maps_np = np.asarray(maps, dtype=real_dtype)
 
     if maps_np.ndim == 3:
         if maps_np.shape[1] != 2:
@@ -214,11 +261,11 @@ def _normalize_maps(maps):
 
     if norm.shape[2] <= 0:
         raise ValueError("maps must contain at least one pixel")
-    return np.ascontiguousarray(norm, dtype=np.float64)
+    return np.ascontiguousarray(norm, dtype=real_dtype)
 
 
-def _normalize_weights(w_map, n_tomo, n_pix):
-    w_np = np.asarray(w_map, dtype=np.float64)
+def _normalize_weights(w_map, n_tomo, n_pix, real_dtype):
+    w_np = np.asarray(w_map, dtype=real_dtype)
 
     if w_np.ndim == 1:
         if w_np.shape[0] != n_pix:
@@ -234,7 +281,7 @@ def _normalize_weights(w_map, n_tomo, n_pix):
     else:
         raise ValueError("w_map must have shape (n_pixels,) or (n_tomo_bins, n_pixels)")
 
-    return np.ascontiguousarray(out, dtype=np.float64)
+    return np.ascontiguousarray(out, dtype=real_dtype)
 
 
 def _validate_n_bins(n_bins):
@@ -287,17 +334,17 @@ def _compute_rotation_from_tree_nodes(tree, idx_i, idx_j):
     return np.cos(angle), np.sin(angle)
 
 
-def _normalize_interactions(interaction_list, tree, n_bins):
+def _normalize_interactions(interaction_list, tree, n_bins, real_dtype):
     if interaction_list is None:
         n0_int32 = np.empty(0, dtype=np.int32)
-        n0_float64 = np.empty(0, dtype=np.float64)
-        return n0_int32, n0_int32, n0_float64, n0_float64, n0_int32
+        n0_real = np.empty(0, dtype=real_dtype)
+        return n0_int32, n0_int32, n0_real, n0_real, n0_int32
 
     inter_np = np.asarray(interaction_list)
     if inter_np.size == 0:
         n0_int32 = np.empty(0, dtype=np.int32)
-        n0_float64 = np.empty(0, dtype=np.float64)
-        return n0_int32, n0_int32, n0_float64, n0_float64, n0_int32
+        n0_real = np.empty(0, dtype=real_dtype)
+        return n0_int32, n0_int32, n0_real, n0_real, n0_int32
 
     if inter_np.ndim != 2 or inter_np.shape[1] not in (2, 4, 5):
         raise ValueError("interaction_list must have shape (N, 2), (N, 4), or (N, 5)")
@@ -313,25 +360,25 @@ def _normalize_interactions(interaction_list, tree, n_bins):
             raise ValueError("interaction_list j indices are out of bounds for tree nodes")
 
     if inter_np.shape[1] == 5:
-        rot_re = np.ascontiguousarray(inter_np[:, 2].astype(np.float64))
-        rot_im = np.ascontiguousarray(inter_np[:, 3].astype(np.float64))
+        rot_re = np.ascontiguousarray(inter_np[:, 2].astype(real_dtype))
+        rot_im = np.ascontiguousarray(inter_np[:, 3].astype(real_dtype))
         bins = np.ascontiguousarray(inter_np[:, 4].astype(np.int32))
     elif inter_np.shape[1] == 4:
         warnings.warn(
             "interaction_list has shape (N, 4): assigning all interactions to angular bin 0",
             stacklevel=2,
         )
-        rot_re = np.ascontiguousarray(inter_np[:, 2].astype(np.float64))
-        rot_im = np.ascontiguousarray(inter_np[:, 3].astype(np.float64))
+        rot_re = np.ascontiguousarray(inter_np[:, 2].astype(real_dtype))
+        rot_im = np.ascontiguousarray(inter_np[:, 3].astype(real_dtype))
         bins = np.zeros(inter_np.shape[0], dtype=np.int32)
     else:
         warnings.warn(
             "interaction_list has shape (N, 2): computing rotations from tree nodes and assigning angular bin 0",
             stacklevel=2,
         )
-        rot_re, rot_im = _compute_rotation_from_tree_nodes(tree, i_idx, j_idx)
-        rot_re = np.ascontiguousarray(rot_re, dtype=np.float64)
-        rot_im = np.ascontiguousarray(rot_im, dtype=np.float64)
+        rot_re64, rot_im64 = _compute_rotation_from_tree_nodes(tree, i_idx, j_idx)
+        rot_re = np.ascontiguousarray(rot_re64.astype(real_dtype))
+        rot_im = np.ascontiguousarray(rot_im64.astype(real_dtype))
         bins = np.zeros(inter_np.shape[0], dtype=np.int32)
 
     if bins.size > 0 and (int(bins.min()) < 0 or int(bins.max()) >= n_bins):
@@ -377,18 +424,18 @@ def _normalize_leaf_inputs(leaf_pairs, leaf_bins, n_bins, n_pix):
     return pairs, bins
 
 
-def _prepare_particle_coords(particle_coords, ra, dec, n_pix, order):
+def _prepare_particle_coords(particle_coords, ra, dec, n_pix, order, real_dtype):
     if particle_coords is not None:
         if len(particle_coords) != 3:
             raise ValueError("particle_coords must be a 3-tuple of arrays")
-        px = np.asarray(particle_coords[0], dtype=np.float64)
-        py = np.asarray(particle_coords[1], dtype=np.float64)
-        pz = np.asarray(particle_coords[2], dtype=np.float64)
+        px = np.asarray(particle_coords[0], dtype=real_dtype)
+        py = np.asarray(particle_coords[1], dtype=real_dtype)
+        pz = np.asarray(particle_coords[2], dtype=real_dtype)
         if px.shape[0] != n_pix or py.shape[0] != n_pix or pz.shape[0] != n_pix:
             raise ValueError("particle_coords arrays must each have length n_pixels")
     elif ra is not None and dec is not None:
-        ra = np.asarray(ra, dtype=np.float64)
-        dec = np.asarray(dec, dtype=np.float64)
+        ra = np.asarray(ra, dtype=real_dtype)
+        dec = np.asarray(dec, dtype=real_dtype)
         if ra.shape[0] != n_pix or dec.shape[0] != n_pix:
             raise ValueError("ra/dec arrays must each have length n_pixels")
         px = np.cos(dec) * np.cos(ra)
@@ -398,21 +445,21 @@ def _prepare_particle_coords(particle_coords, ra, dec, n_pix, order):
         raise ValueError("Must provide particle_coords or ra/dec when leaf_pairs is non-empty")
 
     return (
-        np.ascontiguousarray(px[order], dtype=np.float64),
-        np.ascontiguousarray(py[order], dtype=np.float64),
-        np.ascontiguousarray(pz[order], dtype=np.float64),
+        np.ascontiguousarray(px[order], dtype=real_dtype),
+        np.ascontiguousarray(py[order], dtype=real_dtype),
+        np.ascontiguousarray(pz[order], dtype=real_dtype),
     )
 
 
-def _fill_tree_gpu(shear_map, w_map, tree, levels):
+def _fill_tree_gpu(shear_map, w_map, tree, levels, kernels, cp_real_dtype, cp_complex_dtype):
     if cp is None:
         raise RuntimeError("CuPy not installed.")
     if shear_map.shape[0] != 2:
         raise ValueError("shear_map must have shape (2, n_pixels)")
 
     n_nodes = len(tree["x"])
-    node_shear = cp.zeros(n_nodes, dtype=cp.complex128)
-    node_weight = cp.zeros(n_nodes, dtype=cp.float64)
+    node_shear = cp.zeros(n_nodes, dtype=cp_complex_dtype)
+    node_weight = cp.zeros(n_nodes, dtype=cp_real_dtype)
 
     t_child_left = cp.asarray(tree["child_left"])
     t_child_right = cp.asarray(tree["child_right"])
@@ -420,14 +467,15 @@ def _fill_tree_gpu(shear_map, w_map, tree, levels):
     t_node_end = cp.asarray(tree["node_end"])
     t_idx_array = cp.asarray(tree["idx_array"])
 
-    d_shear = cp.asarray(shear_map)
-    d_w = cp.asarray(w_map)
-    g_pix = d_shear[0] + 1j * d_shear[1]
+    d_shear = cp.asarray(shear_map, dtype=cp_real_dtype)
+    d_w = cp.asarray(w_map, dtype=cp_real_dtype)
+    imag_unit = cp.asarray(1j, dtype=cp_complex_dtype)
+    g_pix = d_shear[0].astype(cp_complex_dtype) + d_shear[1].astype(cp_complex_dtype) * imag_unit
 
     is_leaf = t_child_left == -1
     leaf_indices = cp.where(is_leaf)[0]
     if leaf_indices.size > 0:
-        _leaf_sum_kernel(
+        kernels["leaf_sum"](
             t_node_start[leaf_indices],
             t_node_end[leaf_indices],
             t_idx_array,
@@ -442,7 +490,7 @@ def _fill_tree_gpu(shear_map, w_map, tree, levels):
         node_children = t_child_left[d_indices]
         internal_indices = d_indices[node_children != -1]
         if internal_indices.size > 0:
-            _node_agg_kernel(
+            kernels["node_agg"](
                 t_child_left[internal_indices],
                 t_child_right[internal_indices],
                 node_shear,
@@ -465,14 +513,18 @@ def execute_tree_correlation(
     particle_coords=None,
     ra=None,
     dec=None,
+    dtype=np.float32,
 ):
-    maps_np = _normalize_maps(maps)
+    precision = _resolve_precision(dtype)
+    np_real_dtype = precision["np_real"]
+
+    maps_np = _normalize_maps(maps, np_real_dtype)
     n_tomo, _, n_pix = maps_np.shape
-    weights_np = _normalize_weights(w_map, n_tomo, n_pix)
+    weights_np = _normalize_weights(w_map, n_tomo, n_pix, np_real_dtype)
     n_bins = _validate_n_bins(n_bins)
 
     inter_i, inter_j, inter_rot_re, inter_rot_im, inter_bins = _normalize_interactions(
-        interaction_list, tree, n_bins
+        interaction_list, tree, n_bins, np_real_dtype
     )
     leaf_pairs_np, leaf_bins_np = _normalize_leaf_inputs(leaf_pairs, leaf_bins, n_bins, n_pix)
 
@@ -482,32 +534,44 @@ def execute_tree_correlation(
 
     ordered_coords = None
     if leaf_pairs_np.shape[0] > 0:
-        ordered_coords = _prepare_particle_coords(particle_coords, ra, dec, n_pix, order)
+        ordered_coords = _prepare_particle_coords(particle_coords, ra, dec, n_pix, order, np_real_dtype)
 
     if cp is None:
         warnings.warn("CuPy not found. Returning zeros.", stacklevel=2)
-        return np.zeros((n_tomo, n_tomo, n_bins), dtype=np.float64)
+        return np.zeros((n_tomo, n_tomo, n_bins), dtype=np_real_dtype)
+
+    kernels = _get_precision_kernels(precision["np_real_name"])
+    cp_real_dtype = precision["cp_real"]
+    cp_complex_dtype = precision["cp_complex"]
 
     parents = tree["parents"]
     levels = _get_levels(parents)
     n_nodes = len(tree["x"])
-    node_shear_all = cp.empty((n_tomo, n_nodes), dtype=cp.complex128)
+    node_shear_all = cp.empty((n_tomo, n_nodes), dtype=cp_complex_dtype)
 
     for t in range(n_tomo):
-        node_shear_t, _ = _fill_tree_gpu(maps_np[t], weights_np[t], tree, levels)
+        node_shear_t, _ = _fill_tree_gpu(
+            maps_np[t],
+            weights_np[t],
+            tree,
+            levels,
+            kernels,
+            cp_real_dtype,
+            cp_complex_dtype,
+        )
         node_shear_all[t] = node_shear_t
 
-    out = cp.zeros((n_tomo, n_tomo, n_bins), dtype=cp.float64)
+    out = cp.zeros((n_tomo, n_tomo, n_bins), dtype=cp_real_dtype)
 
     if inter_i.size > 0:
         d_i = cp.asarray(inter_i)
         d_j = cp.asarray(inter_j)
-        d_rot_re = cp.asarray(inter_rot_re)
-        d_rot_im = cp.asarray(inter_rot_im)
+        d_rot_re = cp.asarray(inter_rot_re, dtype=cp_real_dtype)
+        d_rot_im = cp.asarray(inter_rot_im, dtype=cp_real_dtype)
         d_bins = cp.asarray(inter_bins)
         threads = 256
         blocks = (inter_i.size + threads - 1) // threads
-        _tomo_interaction_kernel(
+        kernels["interaction"](
             (blocks,),
             (threads,),
             (
@@ -526,12 +590,13 @@ def execute_tree_correlation(
         )
 
     if leaf_pairs_np.shape[0] > 0:
-        ordered_maps = np.ascontiguousarray(maps_np[:, :, order], dtype=np.float64)
-        ordered_weights = np.ascontiguousarray(weights_np[:, order], dtype=np.float64)
+        ordered_maps = np.ascontiguousarray(maps_np[:, :, order], dtype=np_real_dtype)
+        ordered_weights = np.ascontiguousarray(weights_np[:, order], dtype=np_real_dtype)
 
-        d_ordered_maps = cp.asarray(ordered_maps)
-        d_g_pix = d_ordered_maps[:, 0, :] + 1j * d_ordered_maps[:, 1, :]
-        d_w_pix = cp.asarray(ordered_weights)
+        d_ordered_maps = cp.asarray(ordered_maps, dtype=cp_real_dtype)
+        imag_unit = cp.asarray(1j, dtype=cp_complex_dtype)
+        d_g_pix = d_ordered_maps[:, 0, :].astype(cp_complex_dtype) + d_ordered_maps[:, 1, :].astype(cp_complex_dtype) * imag_unit
+        d_w_pix = cp.asarray(ordered_weights, dtype=cp_real_dtype)
 
         leaf_i = np.ascontiguousarray(leaf_pairs_np[:, 0], dtype=np.int64)
         leaf_j = np.ascontiguousarray(leaf_pairs_np[:, 1], dtype=np.int64)
@@ -540,13 +605,13 @@ def execute_tree_correlation(
         d_leaf_bins = cp.asarray(leaf_bins_np)
 
         px, py, pz = ordered_coords
-        d_px = cp.asarray(px)
-        d_py = cp.asarray(py)
-        d_pz = cp.asarray(pz)
+        d_px = cp.asarray(px, dtype=cp_real_dtype)
+        d_py = cp.asarray(py, dtype=cp_real_dtype)
+        d_pz = cp.asarray(pz, dtype=cp_real_dtype)
 
         threads = 256
         blocks = (leaf_i.size + threads - 1) // threads
-        _tomo_leaf_kernel(
+        kernels["leaf"](
             (blocks,),
             (threads,),
             (

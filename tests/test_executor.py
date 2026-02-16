@@ -22,7 +22,7 @@ def _build_inputs():
 
     tree = build_tree(ra, dec, w)
     inter, inter_bins, leaves, leaf_bins = traverse(
-        tree, None, min_sep=1e-6, max_sep=1.0, nbins=8, slop=1.0
+        tree, None, min_sep=1e-6, max_sep=1.0, nbins=8, bin_slop=0.0
     )
     assert len(inter_bins) == len(inter)
     assert len(leaf_bins) == len(leaves)
@@ -55,6 +55,7 @@ def test_executor_tomographic_output_shape():
             )
             assert corr.shape == (2, 2, n_bins)
             assert np.all(corr == 0.0)
+            assert corr.dtype == np.float32
             assert len(w_log) >= 1
             assert "CuPy not found" in str(w_log[0].message)
     else:
@@ -161,9 +162,38 @@ def test_executor_validation_errors():
             leaf_bins=np.empty(0, dtype=np.int32),
         )
 
+    with pytest.raises(ValueError, match="dtype must be np.float32 or np.float64"):
+        execute_tree_correlation(
+            maps_legacy,
+            w,
+            tree,
+            inter,
+            np.empty((0, 2), dtype=np.int64),
+            n_bins=8,
+            leaf_bins=np.empty(0, dtype=np.int32),
+            dtype=np.float16,
+        )
+
+
+def test_executor_dtype_override():
+    tree, maps_legacy, w, inter, leaves, leaf_bins, coords = _build_inputs()
+    corr = execute_tree_correlation(
+        maps_legacy,
+        w,
+        tree,
+        inter,
+        leaves,
+        n_bins=8,
+        leaf_bins=leaf_bins,
+        particle_coords=coords,
+        dtype=np.float64,
+    )
+    assert corr.dtype == np.float64
+
 if __name__ == "__main__":
     test_executor_tomographic_output_shape()
     test_executor_single_bin_shorthand_shape()
     test_executor_legacy_n_by_2_shape()
     test_executor_validation_errors()
+    test_executor_dtype_override()
     print("Test passed")

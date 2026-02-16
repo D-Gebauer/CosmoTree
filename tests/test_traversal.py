@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 from CosmoTree.tree import build_tree
 from CosmoTree.traversal import traverse
 
@@ -22,12 +23,13 @@ def test_traverse_two_clusters():
     # If we set min_sep=0.1, max_sep=1.0, they should interact.
     
     # 1. Approximation allowed
-    # slop = 0.0. d > rA + rB + slop?
+    # TreeCorr-style criterion: d > (rA + rB) / slopeff, with slopeff=min(bin_slop, angle_slop).
     # d ~ 0.5. rA ~ 0.01, rB ~ 0.01.
-    # 0.5 > 0.02 + 0.
+    # With bin_slop=0.1 and default angle_slop=1.0, slopeff=0.1, so threshold is ~0.2.
+    # 0.5 > 0.2, so approximation is allowed.
     # Should get interaction pair (RootA, RootB).
     inter, inter_bins, leaves, leaf_bins = traverse(
-        tree_a, tree_b, min_sep=0.1, max_sep=1.0, nbins=8, slop=0.0
+        tree_a, tree_b, min_sep=0.1, max_sep=1.0, nbins=8, bin_slop=0.1
     )
     
     assert len(inter) > 0
@@ -46,12 +48,11 @@ def test_traverse_two_clusters():
     assert np.all(inter_bins < 8)
     assert int(inter[0, 4]) == int(inter_bins[0])
     
-    # 2. Approximation disallowed (large slop or small theta implied)
-    # Force descent by setting slop large, e.g., 1.0.
-    # d (0.5) < rA + rB + 1.0.
+    # 2. Approximation disallowed
+    # Force descent by setting bin_slop=0.0 => slopeff=0 => never approximate.
     # Should descend to leaves.
     inter, inter_bins, leaves, leaf_bins = traverse(
-        tree_a, tree_b, min_sep=0.1, max_sep=1.0, nbins=8, slop=1.0
+        tree_a, tree_b, min_sep=0.1, max_sep=1.0, nbins=8, bin_slop=0.0
     )
     
     assert len(inter) == 0
@@ -90,7 +91,7 @@ def test_interaction_list_format():
     tree_b = build_tree(ra_b, dec_b, w_b, min_size=0.0)
 
     inter, inter_bins, leaves, leaf_bins = traverse(
-        tree_a, tree_b, min_sep=0.1, max_sep=1.0, nbins=8, slop=0.0
+        tree_a, tree_b, min_sep=0.1, max_sep=1.0, nbins=8, bin_slop=0.1
     )
 
     assert inter.ndim == 2
@@ -109,9 +110,9 @@ def test_auto_correlation_symmetry():
     
     # Auto correlation
     # min_sep very small.
-    # slop large to force leaves.
+    # bin_slop=0 to force leaves.
     inter, inter_bins, leaves, leaf_bins = traverse(
-        tree, None, min_sep=1e-6, max_sep=1.0, nbins=8, slop=1.0
+        tree, None, min_sep=1e-6, max_sep=1.0, nbins=8, bin_slop=0.0
     )
     
     # Should find all pairs (i, j) with i < j (since i==j avoided in code for auto)
@@ -153,7 +154,7 @@ def test_range_limit():
     
     # Max sep 0.5
     inter, inter_bins, leaves, leaf_bins = traverse(
-        tree, None, min_sep=1e-6, max_sep=0.5, nbins=8, slop=1.0
+        tree, None, min_sep=1e-6, max_sep=0.5, nbins=8, bin_slop=0.0
     )
     assert len(leaves) == 0
     assert len(inter) == 0
@@ -162,15 +163,51 @@ def test_range_limit():
     
     # Min sep 0.5, Max 1.5
     inter, inter_bins, leaves, leaf_bins = traverse(
-        tree, None, min_sep=0.5, max_sep=1.5, nbins=8, slop=1.0
+        tree, None, min_sep=0.5, max_sep=1.5, nbins=8, bin_slop=0.0
     )
     assert len(leaves) == 1 # (0, 1)
     assert len(inter) == 0
     assert len(inter_bins) == 0
     assert len(leaf_bins) == 1
 
+
+def test_arc_metric_range_selection_differs_from_euclidean():
+    # Two points separated by ~1 radian on the sphere.
+    ra = np.array([0.0, 1.0], dtype=np.float64)
+    dec = np.array([0.0, 0.0], dtype=np.float64)
+    w = np.ones(2, dtype=np.float64)
+    tree = build_tree(ra, dec, w, min_size=0.0)
+
+    # In arc metric this window includes the pair (true arc distance ~=1.0).
+    # In euclidean/chord metric it excludes it (chord distance ~=0.9589).
+    inter_e, inter_bins_e, leaves_e, leaf_bins_e = traverse(
+        tree, None, min_sep=0.99, max_sep=1.01, nbins=8, metric="Euclidean", bin_slop=0.0
+    )
+    assert len(inter_e) == 0
+    assert len(inter_bins_e) == 0
+    assert len(leaves_e) == 0
+    assert len(leaf_bins_e) == 0
+
+    inter_a, inter_bins_a, leaves_a, leaf_bins_a = traverse(
+        tree, None, min_sep=0.99, max_sep=1.01, nbins=8, metric="Arc", bin_slop=0.0
+    )
+    assert len(inter_a) == 0
+    assert len(inter_bins_a) == 0
+    assert len(leaves_a) == 1
+    assert len(leaf_bins_a) == 1
+
+
+def test_arc_metric_rejects_max_sep_above_pi():
+    ra = np.array([0.0, 0.2], dtype=np.float64)
+    dec = np.array([0.0, 0.0], dtype=np.float64)
+    tree = build_tree(ra, dec)
+    with pytest.raises(ValueError, match="<= pi"):
+        traverse(tree, None, min_sep=0.1, max_sep=np.pi + 1e-3, nbins=8, metric="Arc")
+
 if __name__ == "__main__":
     test_traverse_two_clusters()
     test_auto_correlation_symmetry()
     test_range_limit()
+    test_arc_metric_range_selection_differs_from_euclidean()
+    test_arc_metric_rejects_max_sep_above_pi()
     print("All tests passed")
