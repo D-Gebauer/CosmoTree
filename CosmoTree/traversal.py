@@ -13,18 +13,16 @@ def _push_stack(stack, ptr, node_a, node_b):
 def _traverse_numba(
     ax, ay, az, arad, achild_left, achild_right, astart, aend, aidx,
     bx, by, bz, brad, bchild_left, bchild_right, bstart, bend, bidx,
-    min_sep, max_sep, slop, is_auto
+    min_sep, max_sep, slop, is_auto,
+    max_stack, max_inter, max_leaf
 ):
-    MAX_STACK = 1000000 
-    stack = np.empty((MAX_STACK, 2), dtype=np.int32)
+    stack = np.empty((max_stack, 2), dtype=np.int32)
     stack_ptr = 0
     
-    MAX_INTER = 10000000 # 10M
-    interaction_list = np.empty((MAX_INTER, 2), dtype=np.int32)
+    interaction_list = np.empty((max_inter, 2), dtype=np.int32)
     inter_ptr = 0
     
-    MAX_LEAF = 10000000 # 10M
-    leaf_pairs = np.empty((MAX_LEAF, 2), dtype=np.int64)
+    leaf_pairs = np.empty((max_leaf, 2), dtype=np.int64)
     leaf_ptr = 0
     
     # Push root
@@ -61,7 +59,7 @@ def _traverse_numba(
                 can_approximate = True
                 
         if can_approximate:
-            if inter_ptr < MAX_INTER:
+            if inter_ptr < max_inter:
                 interaction_list[inter_ptr, 0] = i
                 interaction_list[inter_ptr, 1] = j
                 inter_ptr += 1
@@ -91,7 +89,7 @@ def _traverse_numba(
                 for kb in range(start_kb, end_b):
                     idx_b = bidx[kb]
                     
-                    if leaf_ptr < MAX_LEAF:
+                    if leaf_ptr < max_leaf:
                         leaf_pairs[leaf_ptr, 0] = idx_a
                         leaf_pairs[leaf_ptr, 1] = idx_b
                         leaf_ptr += 1
@@ -120,8 +118,8 @@ def _traverse_numba(
                 # Push (L, L), (R, R), (L, R)
                 
                 # Check stack overflow
-                if stack_ptr + 3 > MAX_STACK:
-                     return interaction_list, leaf_pairs, -3
+                if stack_ptr + 3 > max_stack:
+                    return interaction_list, leaf_pairs, -3
                      
                 stack[stack_ptr, 0] = left
                 stack[stack_ptr, 1] = right
@@ -135,8 +133,8 @@ def _traverse_numba(
                 stack[stack_ptr, 1] = left
                 stack_ptr += 1
             else:
-                if stack_ptr + 2 > MAX_STACK:
-                     return interaction_list, leaf_pairs, -3
+                if stack_ptr + 2 > max_stack:
+                    return interaction_list, leaf_pairs, -3
 
                 stack[stack_ptr, 0] = right
                 stack[stack_ptr, 1] = j
@@ -149,9 +147,9 @@ def _traverse_numba(
             # Split B
             left = bchild_left[j]
             right = bchild_right[j]
-            
-            if stack_ptr + 2 > MAX_STACK:
-                 return interaction_list, leaf_pairs, -3
+
+            if stack_ptr + 2 > max_stack:
+                return interaction_list, leaf_pairs, -3
 
             stack[stack_ptr, 0] = i
             stack[stack_ptr, 1] = right
@@ -163,7 +161,18 @@ def _traverse_numba(
             
     return interaction_list[:inter_ptr], leaf_pairs[:leaf_ptr], 0
 
-def traverse(tree_a, tree_b=None, min_sep=0.0, max_sep=1.0, slop=0.0):
+def traverse(
+    tree_a,
+    tree_b=None,
+    min_sep=0.0,
+    max_sep=1.0,
+    slop=0.0,
+    max_stack=1000000,
+    max_inter=10000000,
+    max_leaf=10000000,
+    growth_factor=2.0,
+    max_retries=5
+):
     """
     Perform dual-tree traversal to find interaction pairs.
     """
@@ -195,17 +204,34 @@ def traverse(tree_a, tree_b=None, min_sep=0.0, max_sep=1.0, slop=0.0):
     bend = tree_b['node_end']
     bidx = tree_b['idx_array']
     
-    inter, leaves, status = _traverse_numba(
-        ax, ay, az, arad, achild_left, achild_right, astart, aend, aidx,
-        bx, by, bz, brad, bchild_left, bchild_right, bstart, bend, bidx,
-        min_sep, max_sep, float(slop), is_auto
-    )
-    
-    if status == -1:
-        print("Warning: Interaction list overflow")
-    elif status == -2:
-        print("Warning: Leaf pairs list overflow")
-    elif status == -3:
-        print("Warning: Stack overflow")
-        
-    return inter, leaves
+    cur_stack = int(max_stack)
+    cur_inter = int(max_inter)
+    cur_leaf = int(max_leaf)
+    retries = 0
+
+    while True:
+        inter, leaves, status = _traverse_numba(
+            ax, ay, az, arad, achild_left, achild_right, astart, aend, aidx,
+            bx, by, bz, brad, bchild_left, bchild_right, bstart, bend, bidx,
+            min_sep, max_sep, float(slop), is_auto,
+            cur_stack, cur_inter, cur_leaf
+        )
+
+        if status == 0:
+            return inter, leaves
+
+        if status == -1:
+            print("Warning: Interaction list overflow, retrying with larger buffer")
+            cur_inter = int(cur_inter * growth_factor)
+        elif status == -2:
+            print("Warning: Leaf pairs list overflow, retrying with larger buffer")
+            cur_leaf = int(cur_leaf * growth_factor)
+        elif status == -3:
+            print("Warning: Stack overflow, retrying with larger buffer")
+            cur_stack = int(cur_stack * growth_factor)
+        else:
+            raise RuntimeError("Traversal failed with unknown status")
+
+        retries += 1
+        if retries > max_retries:
+            raise RuntimeError("Traversal exceeded max_retries; increase buffer sizes or max_retries")

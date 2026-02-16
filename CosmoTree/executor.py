@@ -241,10 +241,33 @@ def _fill_tree_gpu(shear_map, w_map, tree, levels):
             
     return node_shear, node_weight
 
-def execute_tree_correlation(shear_map, w_map, tree, interaction_list, leaf_pairs, particle_coords=None):
+def execute_tree_correlation(
+    shear_map,
+    w_map,
+    tree,
+    interaction_list,
+    leaf_pairs,
+    particle_coords=None,
+    ra=None,
+    dec=None
+):
     if cp is None:
         warnings.warn("CuPy not found. Returning 0.")
         return 0j, 0.0
+
+    n_pix = shear_map.shape[0]
+    if w_map.shape[0] != n_pix:
+        raise ValueError("w_map length must match shear_map length")
+
+    if leaf_pairs is not None and len(leaf_pairs) > 0:
+        leaf_pairs_np = np.asarray(leaf_pairs)
+        if leaf_pairs_np.ndim != 2 or leaf_pairs_np.shape[1] != 2:
+            raise ValueError("leaf_pairs must be a 2D array with shape (N, 2)")
+        if leaf_pairs_np.size > 0:
+            min_idx = int(leaf_pairs_np.min())
+            max_idx = int(leaf_pairs_np.max())
+            if min_idx < 0 or max_idx >= n_pix:
+                raise ValueError("leaf_pairs indices are out of bounds for shear_map")
 
     parents = tree['parents']
     levels = _get_levels(parents)
@@ -278,18 +301,33 @@ def execute_tree_correlation(shear_map, w_map, tree, interaction_list, leaf_pair
         d_shear = cp.asarray(shear_map)
         d_w = cp.asarray(w_map)
         g_pix = d_shear[:, 0] + 1j * d_shear[:, 1]
-        
+
         px, py, pz = None, None, None
         if particle_coords is not None:
+            if len(particle_coords) != 3:
+                raise ValueError("particle_coords must be a 3-tuple of arrays")
+            n_coords = particle_coords[0].shape[0]
+            if (particle_coords[1].shape[0] != n_coords) or (particle_coords[2].shape[0] != n_coords):
+                raise ValueError("particle_coords arrays must have matching lengths")
+            if n_coords != n_pix:
+                raise ValueError("particle_coords length must match shear_map length")
             px = cp.asarray(particle_coords[0])
             py = cp.asarray(particle_coords[1])
             pz = cp.asarray(particle_coords[2])
+        elif ra is not None and dec is not None:
+            if len(ra) != len(dec):
+                raise ValueError("ra and dec must have matching lengths")
+            if len(ra) != n_pix:
+                raise ValueError("ra/dec length must match shear_map length")
+            x = np.cos(dec) * np.cos(ra)
+            y = np.cos(dec) * np.sin(ra)
+            z = np.sin(dec)
+            px = cp.asarray(x)
+            py = cp.asarray(y)
+            pz = cp.asarray(z)
         else:
-             if shear_map.shape[0] > 0:
-                 px = cp.zeros(shear_map.shape[0], dtype=cp.float64)
-                 py = cp.zeros(shear_map.shape[0], dtype=cp.float64)
-                 pz = cp.zeros(shear_map.shape[0], dtype=cp.float64)
-        
+            raise ValueError("Must provide particle coordinates (particle_coords or ra/dec) for leaf calculations")
+
         _leaf_pair_kernel(
             d_leaves[:, 0],
             d_leaves[:, 1],
